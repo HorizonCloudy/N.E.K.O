@@ -165,33 +165,42 @@ def test_a_sync_sink_that_raises_is_logged_and_the_transport_survives():
 
 # ---- reception state -----------------------------------------------------
 
-def test_turning_push_off_takes_the_group_out_of_full_message_mode():
+def test_proactive_message_notice_does_not_change_the_reception_mode():
+    # GROUP_MSG_REJECT / GROUP_MSG_RECEIVE are the admin allowing or blocking the
+    # bot's *proactive* sends ("接受/拒绝机器人主动消息"). They say nothing about
+    # whether the group pushes every message, so they must not touch the reception
+    # state: mapping them onto recv_msg_setting made an admin enabling proactive
+    # push look like full-message delivery, and a refusal erased the proof that a
+    # real GROUP_MESSAGE_CREATE had already arrived.
     conn = _conn()
     _prove_full_push(conn, "G1")
-    assert conn.receives_all_messages is True
     assert conn.group_receives_all_messages("G1") is True
 
     run(conn._dispatch_event("GROUP_MSG_REJECT", {"group_openid": "G1"}, "e2"))
-    assert conn.group_receives_all_messages("G1") is False
-    assert conn.receives_all_messages is False
-    assert conn.needs_attention is False
+    assert conn.group_receives_all_messages("G1") is True
+    assert conn.group_recv_msg_setting("G1") == ""
+    assert conn.group_proactive_allowed("G1") is False
+
+    run(conn._dispatch_event("GROUP_MSG_RECEIVE", {"group_openid": "G1"}, "e3"))
+    assert conn.group_proactive_allowed("G1") is True
+    assert conn.group_receives_all_messages("G1") is True
 
 
-def test_one_group_turning_push_off_does_not_silence_another():
+def test_proactive_state_is_per_group_and_unknown_until_a_notice_arrives():
     conn = _conn()
-    _prove_full_push(conn, "G1")
-    _prove_full_push(conn, "G2")
-    run(conn._dispatch_event("GROUP_MSG_REJECT", {"group_openid": "G1"}, "e3"))
-    assert conn.group_receives_all_messages("G1") is False
-    assert conn.group_receives_all_messages("G2") is True
-    assert conn.receives_all_messages is True
+    assert conn.group_proactive_allowed("G1") is None
+    assert conn.group_proactive_allowed("") is None
+    run(conn._dispatch_event("GROUP_MSG_REJECT", {"group_openid": "G1"}, "e1"))
+    run(conn._dispatch_event("GROUP_MSG_RECEIVE", {"group_openid": "G2"}, "e2"))
+    assert conn.group_proactive_allowed("G1") is False
+    assert conn.group_proactive_allowed("G2") is True
 
 
-def test_group_msg_receive_proves_the_mode_without_any_traffic():
+def test_being_removed_from_a_group_forgets_its_proactive_state():
     conn = _conn()
-    run(conn._dispatch_event("GROUP_MSG_RECEIVE", {"group_openid": "G7"}, "e4"))
-    assert conn.group_recv_msg_setting("G7") == "all"
-    assert conn.group_receives_all_messages("G7") is True
+    run(conn._dispatch_event("GROUP_MSG_RECEIVE", {"group_openid": "G1"}, "e1"))
+    run(conn._dispatch_event("GROUP_DEL_ROBOT", {"group_openid": "G1"}, "e2"))
+    assert conn.group_proactive_allowed("G1") is None
 
 
 def test_being_removed_from_a_group_forgets_what_that_group_proved():
@@ -269,3 +278,146 @@ def test_a_successful_resume_keeps_the_mode_it_already_proved():
 
     run(conn._handshake(is_reconnect=True))
     assert conn._all_messages_observed_groups == {"G1"}
+
+# ---- attribution window: the case in-place merging cannot reach ----------------
+#
+# A waiting consumer sits on queue.get(), so the full-push copy leaves the queue
+# before its AT frame arrives. _merge_pending_duplicate then finds nothing to
+# upgrade and the summon is delivered as chatter anyway -- which is the common
+# case, not the rare one. The hold covers it: wait one short window for the AT
+# frame, then deliver.
+
+def test_idle_consumer_still_gets_the_summon_from_the_late_at_frame():
+    import asyncio
+
+    monkey_loop = asyncio.new_event_loop()
+    conn = QQOpenPlatformConnection.__new__(QQOpenPlatformConnection)
+    conn._self_id = ""
+    conn.logger = None
+    conn._message_queue = asyncio.Queue(maxsize=8)
+    full = {
+        "id": "summon-1", "group_openid": "G1", "content": "喂 <@GGGGGGGGGGGGGGGG>",
+        "author": {"member_openid": "MA"},
+    }
+    at = dict(full, mentions=[{"member_openid": "GGGGGGGGGGGGGGGG", "is_you": True}])
+
+    async def go():
+        delivered = []
+
+        async def consumer():
+            while True:
+                msg = await conn.receive_message(timeout=0.05)
+                if msg:
+                    delivered.append(msg)
+
+        drive = asyncio.ensure_future(go_frames())
+        watch = asyncio.ensure_future(consumer())
+        await asyncio.wait_for(drive, timeout=2)
+        await asyncio.sleep(0.7)              # past the attribution window, so the
+        watch.cancel()                        # held copy has flushed and dropped
+        try:
+            await watch                        # reaped, not left pending on close
+        except asyncio.CancelledError:
+            pass
+        return delivered
+
+    async def go_frames():
+        await conn._dispatch_event("GROUP_MESSAGE_CREATE", full, "e1")
+        await asyncio.sleep(0.02)             # the consumer takes this one first
+        await conn._dispatch_event("GROUP_AT_MESSAGE_CREATE", at, "e2")
+
+    delivered = monkey_loop.run_until_complete(go())
+    monkey_loop.close()
+
+    assert len(delivered) == 1                # one delivery, not two, not zero
+    assert delivered[0]["is_at_bot"] is True
+    assert delivered[0]["mentions_other_user"] is False
+
+
+def test_held_copy_is_still_delivered_when_no_at_frame_comes(monkeypatch):
+    import asyncio
+
+    monkeypatch.setattr(mod, "_AT_MERGE_WINDOW_SECONDS", 0.01)
+    conn = _conn()
+    payload = {
+        "id": "lonely-1", "group_openid": "G5", "content": "看 <@HHHHHHHHHHHHHHHH>",
+        "author": {"member_openid": "MA"},
+    }
+
+    async def go():
+        await conn._dispatch_event("GROUP_MESSAGE_CREATE", payload, "e1")
+        assert conn._message_queue.empty()     # held, not dropped
+        await asyncio.sleep(0.05)
+        return conn._message_queue.get_nowait()
+
+    msg = asyncio.run(go())
+    assert msg["message_id"] == "lonely-1"
+    assert msg["is_at_bot"] is False
+
+
+def test_hold_is_flushed_on_disconnect_rather_than_dropped():
+    import asyncio
+
+    conn = _conn()
+    payload = {
+        "id": "held-1", "group_openid": "G6", "content": "hi <@IIIIIIIIIIIIIIII>",
+        "author": {"member_openid": "MA"},
+    }
+
+    async def go():
+        await conn._dispatch_event("GROUP_MESSAGE_CREATE", payload, "e1")
+        assert "held-1" in conn._attribution_hold
+        await conn.disconnect()
+        return conn._message_queue.qsize(), conn._attribution_hold
+
+    size, pending = asyncio.run(go())
+    assert pending == {}                       # nothing left holding
+    assert size == 1                           # and nothing lost
+
+
+def test_merge_upgrades_the_ownership_flag_too(monkeypatch):
+    # An AT frame that arrives for a still-queued full copy also settles
+    # mentions_other_user: without this the consumer reads "summoned me AND
+    # somebody else" for a message that named only the bot.
+    import asyncio
+
+    conn = _conn()
+    full = {
+        "id": "summon-9", "group_openid": "G1", "content": "喂 <@JJJJJJJJJJJJJJJJ>",
+        "author": {"member_openid": "MA"},
+    }
+    at = dict(full, mentions=[{"member_openid": "JJJJJJJJJJJJJJJJ", "is_you": True}])
+
+    async def go():
+        await conn._dispatch_event("GROUP_MESSAGE_CREATE", full, "e1")
+        await asyncio.sleep(0)
+        await conn._dispatch_event("GROUP_AT_MESSAGE_CREATE", at, "e2")
+        await asyncio.sleep(0)
+        return conn._message_queue
+
+    queue = asyncio.run(go())
+    assert queue.qsize() == 1
+    msg = queue.get_nowait()
+    assert msg["is_at_bot"] is True
+    assert msg["mentions_other_user"] is False
+
+
+def test_quoted_reply_is_not_evicted_as_chatter():
+    import asyncio
+
+    conn = QQOpenPlatformConnection.__new__(QQOpenPlatformConnection)
+    conn._self_id = ""
+    conn.logger = None
+    conn._message_queue = asyncio.Queue(maxsize=2)
+    reply = {"message_id": "r1", "is_at_bot": False, "is_reply_to_bot": True}
+    assert conn._enqueue_inbound(reply) is None
+    assert conn._enqueue_inbound({"message_id": "c1", "is_at_bot": False}) is None
+    # Queue full now. The oldest unaddressed copy (c1) is sacrificed and the newcomer
+    # fits; the direct reply r1 stays. Under the old predicate r1 and c1 looked the
+    # same -- both "not @bot" -- so the reply to the bot was the first thing a burst
+    # could throw away.
+    assert conn._enqueue_inbound({"message_id": "c2", "is_at_bot": False}) is None
+    queued = [conn._message_queue.get_nowait()["message_id"] for _ in range(2)]
+    assert "r1" in queued
+    assert "c1" not in queued
+    assert "c2" in queued

@@ -768,3 +768,35 @@ def test_quoting_the_bots_own_message_is_recognised_on_receive():
         "author": {"member_openid": "MA"},
         "message_reference": {"message_id": "SOMEBODY-ELSE"}})
     assert other["is_reply_to_bot"] is False
+
+def test_token_refresh_failure_on_the_retry_path_stays_classified():
+    # The first token call in _api is wrapped; the one behind the 40011027 retry was
+    # not, so a transport failure there escaped as a raw httpx error and broke the
+    # documented "media send answers None" degrade.
+    import httpx
+
+    conn = _conn([
+        _Response({"err_code": 40011027, "message": "token expired"}),
+        httpx.ConnectError("token endpoint unreachable"),
+    ])
+    with pytest.raises(QQOpenPlatformAPIError) as got:
+        run(conn._api("GET", "/v2/groups/G1/bot_state"))
+    assert "token refresh failed" in str(got.value)
+
+
+def test_explicit_file_name_survives_to_the_upload_body():
+    # upload_group_file(file, name) took a name and threw it away: the body carried
+    # the base64 magic-table guess (image.png) or the temporary basename, and that is
+    # the name the recipient sees on the file.
+    import base64 as _b64
+
+    payload = "base64://" + _b64.b64encode(b"%PDF-1.4 fake").decode()
+
+    conn = _conn([_Response({"file_info": "FI"}), _Response({"id": "m-file"})])
+    run(conn.upload_group_file(payload, "report.pdf", group_id="G1"))
+    assert conn._http.calls[0][2]["file_name"] == "report.pdf"
+
+    conn2 = _conn([_Response({"file_info": "FI2"}), _Response({"id": "m-file2"})])
+    run(conn2.upload_private_file(payload, "notes.txt", user_id="U1"))
+    assert conn2._http.calls[0][2]["file_name"] == "notes.txt"
+

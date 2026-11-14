@@ -141,6 +141,12 @@ _NOTICE_SINK_MAX_TASKS = 32
 #: that group again without a restart.
 _SHUT_RULE_TTL_SECONDS = 300.0
 
+#: How long one unattributable group message waits for its ``GROUP_AT_MESSAGE_CREATE``
+#: copy before it goes out as chatter. Short because it adds latency to the reply path,
+#: and long enough for the platform to deliver the second frame: the two arrive
+#: back-to-back in every observation so far.
+_AT_MERGE_WINDOW_SECONDS = 0.5
+
 # ==========================================
 # R11 identity scope: resolved
 # (docs/design/speaker-trust-entity-semantics.md §2.15.4)
@@ -420,6 +426,13 @@ class QQOpenPlatformConnection(QQOpenPlatformMediaMixin, ConnectionBase):
         self._recv_msg_setting_by_group: dict[str, str] = {}
         self._bot_openid_by_group: dict[str, str] = {}
         self._bot_member_role_by_group: dict[str, str] = {}
+        #: group_id -> the group allows unprompted (proactive) sends. From
+        #: GROUP_MSG_RECEIVE / GROUP_MSG_REJECT and bot_state.allow_proactive_msg.
+        self._proactive_allowed_by_group: dict[str, bool] = {}
+        #: Full-push copies whose @ could not be attributed, waiting one window for
+        #: the AT frame. See ``_hold_for_at_frame``.
+        self._attribution_hold: dict[str, dict] = {}
+        self._attribution_hold_tasks: set = set()
         #: Inbound ids accepted recently -> the monotonic time they arrived. Guards
         #: against the platform delivering one message twice (see ``_enqueue_inbound``).
         self._seen_inbound_ids: dict[str, float] = {}
@@ -491,6 +504,19 @@ class QQOpenPlatformConnection(QQOpenPlatformMediaMixin, ConnectionBase):
         if gid in self._mutable("_all_messages_observed_groups", set):
             return True
         return self.group_recv_msg_setting(gid) == "all"
+
+    def group_proactive_allowed(self, group_id: str):
+        """Whether one group lets the bot send unprompted. ``None`` when unknown.
+
+        ``GROUP_MSG_RECEIVE`` / ``GROUP_MSG_REJECT`` set this, and ``bot_state``
+        confirms it with ``allow_proactive_msg``. Nothing about it belongs in
+        :attr:`receives_all_messages`: proactive push and full message push are two
+        different switches pointing in opposite directions (out and in).
+        """
+        gid = str(group_id or "").strip()
+        if not gid:
+            return None
+        return self._mutable("_proactive_allowed_by_group", dict).get(gid)
 
     def group_recv_msg_setting(self, group_id: str) -> str:
         """``all`` / ``only_mention`` / ``mention_and_context`` / ``""`` for one group."""
@@ -659,6 +685,14 @@ class QQOpenPlatformConnection(QQOpenPlatformMediaMixin, ConnectionBase):
         # is "stop, then start" -- deterministic, never a mid-flight split.
         self._pinned_api_base = None
         self._cancel_inbound_sink_tasks()
+        # A held copy must not die with the connection. No AT frame from the old
+        # session will ever arrive for it, and the new session will not re-send the
+        # message, so flush what is waiting before the tasks go away.
+        for held_id in list(self._mutable("_attribution_hold", dict)):
+            self._release_attribution_hold(held_id)
+        for task in list(self._mutable("_attribution_hold_tasks", set)):
+            task.cancel()
+        self._attribution_hold_tasks.clear()
         # Detached notice sinks belong to this connection: leaving them running past a
         # stop means a callback lands in the UI after the user pressed stop.
         for task in list(self._mutable("_sink_tasks", set)):
@@ -804,6 +838,9 @@ class QQOpenPlatformConnection(QQOpenPlatformMediaMixin, ConnectionBase):
             if not msg:
                 return
             self._remember_group(msg.get("group_id") or "")
+            if event_type == "GROUP_MESSAGE_CREATE" and self._attribution_ambiguous(data):
+                self._hold_for_at_frame(msg)
+                return
             refusal = self._enqueue_inbound(msg)
             if refusal == "duplicate" and self.logger:
                 # Same message already queued from another event type: routine, but it
@@ -833,21 +870,31 @@ class QQOpenPlatformConnection(QQOpenPlatformMediaMixin, ConnectionBase):
 
         ``receives_all_messages`` and ``needs_attention`` used to be one-way latches:
         the first ``GROUP_MESSAGE_CREATE`` set them and nothing ever cleared them, not
-        even ``GROUP_MSG_REJECT``, ``GROUP_DEL_ROBOT`` or a reconnect. A group that
-        turned push off kept being advertised as full-push for the life of the
-        connection, and the consumer kept paying for attention arbitration on a channel
-        that now only delivers @mentions.
+        even ``GROUP_DEL_ROBOT`` or a reconnect. Being removed from a group kept the
+        group advertised as full-push for the life of the connection.
+
+        Only two things reset the proof, and both are real changes of state: leaving
+        the group, and a new Identify session (see ``_handshake``).
+
+        ``GROUP_MSG_RECEIVE`` and ``GROUP_MSG_REJECT`` deliberately do NOT touch it.
+        Those two notice the group administrator allowed or blocked the bot's
+        *proactive* messages (the platform labels them "accept" and "reject" the
+        robot's active messages) -- a send-side permission. They
+        say nothing about ``recv_msg_setting``, which is the push-side choice between
+        "@-only" and "every message". Mapping them onto the reception state turned an
+        admin enabling proactive push into a claim that the group delivers every
+        message, and made the consumer pay for attention arbitration it does not need.
+        They set ``_proactive_allowed_by_group`` instead, which is what they describe.
 
         State is per group, so the reset is per group too: being removed from one group
         must not revoke the proof another group already gave.
         """
         gid = str(payload.get("group_id") or "").strip()
         if event_type == "GROUP_MSG_RECEIVE" and gid:
-            self._mutable("_recv_msg_setting_by_group", dict)[gid] = "all"
+            self._mutable("_proactive_allowed_by_group", dict)[gid] = True
             return
         if event_type == "GROUP_MSG_REJECT" and gid:
-            self._mutable("_recv_msg_setting_by_group", dict)[gid] = "only_mention"
-            self._mutable("_all_messages_observed_groups", set).discard(gid)
+            self._mutable("_proactive_allowed_by_group", dict)[gid] = False
             return
         if event_type == "GROUP_DEL_ROBOT" and gid:
             # Out of this group: nothing it once proved still applies.
@@ -858,6 +905,7 @@ class QQOpenPlatformConnection(QQOpenPlatformMediaMixin, ConnectionBase):
             self._mutable("_bot_member_role_by_group", dict).pop(gid, None)
             self._mutable("_shut_global_rule", dict).pop(gid, None)
             self._mutable("_shut_global_rule_at", dict).pop(gid, None)
+            self._mutable("_proactive_allowed_by_group", dict).pop(gid, None)
 
     def _fan_out_notice(self, event_type: str, payload: dict) -> None:
         """Hand one notice to every sink without waiting on any of them.
@@ -912,6 +960,84 @@ class QQOpenPlatformConnection(QQOpenPlatformMediaMixin, ConnectionBase):
         except Exception as exc:
             if self.logger:
                 self.logger.warning(f"[QQOpenPlatform] 事件监听器异常({event_type}): {exc}")
+
+    def _attribution_ambiguous(self, data: dict) -> bool:
+        """True when a full-push frame @-mentions somebody we cannot identify as us.
+
+        Same three inputs ``_convert_event`` uses, and it must stay in step with it:
+        an inline marker the ``mentions`` array does not explain, no ``is_you`` in the
+        payload, and no openid learned for this group yet. Keep the two in sync or one
+        of them silently stops firing.
+        """
+        content = str(data.get("content") or "")
+        gid = str(data.get("group_id") or data.get("group_openid") or "").strip()
+        if not gid or self._remembered_bot_openid(gid):
+            return False
+        inline = _AT_OPENID_RE.findall(content) + _AT_LEGACY_RE.findall(content)
+        if not inline:
+            return False
+        structured = set()
+        for item in data.get("mentions") or []:
+            if isinstance(item, dict):
+                if item.get("is_you") is True:
+                    return False
+                who = str(
+                    item.get("member_openid") or item.get("openid") or item.get("id") or ""
+                ).strip()
+                if who:
+                    structured.add(who)
+        return any(who not in structured for who in inline)
+
+    def _hold_for_at_frame(self, msg: dict[str, Any]) -> None:
+        """Wait one short window before delivering an unattributable group message.
+
+        The summon can reach us as ``GROUP_MESSAGE_CREATE`` first and
+        ``GROUP_AT_MESSAGE_CREATE`` second. In-place merging only helps while the
+        first copy is still in the queue, and the common case is a waiting consumer
+        that takes it immediately: the AT frame then found nothing to upgrade and the
+        summon was delivered as chatter anyway.
+
+        Holding the unattributable copy closes that hole, and costs one window only
+        for frames that carry an @ we cannot attribute while the group's openid is
+        still unknown -- a per-group, once-per-session state. If the AT frame arrives,
+        it converts (``is_at_bot=True`` is the platform's own statement), enqueues,
+        and this copy is dropped as the duplicate on flush. If it never arrives, the
+        copy goes out unchanged, which is what happened before this existed.
+        """
+        mid = str(msg.get("message_id") or "").strip()
+        if not mid:
+            self._enqueue_inbound(msg)
+            return
+        self._mutable("_attribution_hold", dict)[mid] = msg
+        task = asyncio.create_task(self._flush_attribution_hold(mid))
+        tasks = self._mutable("_attribution_hold_tasks", set)
+        tasks.add(task)
+        task.add_done_callback(tasks.discard)
+
+    async def _flush_attribution_hold(self, mid: str) -> None:
+        """Deliver a held copy if no better-attributed frame took over first."""
+        try:
+            await asyncio.sleep(_AT_MERGE_WINDOW_SECONDS)
+        except asyncio.CancelledError:
+            self._release_attribution_hold(mid)
+            raise
+        self._release_attribution_hold(mid)
+
+    def _release_attribution_hold(self, mid: str) -> None:
+        msg = self._mutable("_attribution_hold", dict).pop(mid, None)
+        if msg is None:
+            return
+        refusal = self._enqueue_inbound(msg)
+        if self.logger:
+            if refusal == "duplicate":
+                # The AT frame got there first: the summon is already queued with the
+                # platform's own attribution, so this copy is the one to drop.
+                self.logger.info(
+                    f"[QQOpenPlatform] 点名帧已到达，丢弃未归因的全量副本 {mid!r}")
+            else:
+                self.logger.info(
+                    f"[QQOpenPlatform] 归因等待结束，按未点名投递 {mid!r}"
+                    f"（该群仍未学到机器人自己的 member_openid）")
 
     def _normalize_notice(self, event_type: str, data: dict, envelope_id: str) -> dict:
         """Common shape for non-message events (``channel`` matches ``CHANNEL``)."""
@@ -1129,6 +1255,12 @@ class QQOpenPlatformConnection(QQOpenPlatformMediaMixin, ConnectionBase):
             changed = False
             if msg.get("is_at_bot") and not queued.get("is_at_bot"):
                 queued["is_at_bot"] = True
+                # The AT frame is authoritative about ownership too. The full-push copy
+                # guessed ``mentions_other_user=True`` because it could not name the
+                # bot among the targets; leaving that flag alone delivered a message
+                # that reads as "summoned the bot AND somebody else", which consumers
+                # treat as a conversation not to interrupt.
+                queued["mentions_other_user"] = bool(msg.get("mentions_other_user"))
                 changed = True
             for key in ("mentions_all", "quoted_message_id", "is_reply_to_bot"):
                 if msg.get(key) and not queued.get(key):
@@ -1148,6 +1280,16 @@ class QQOpenPlatformConnection(QQOpenPlatformMediaMixin, ConnectionBase):
                     f"（is_at_bot={queued.get('is_at_bot')}）")
             return True
         return False
+
+    @staticmethod
+    def _is_addressed(msg: dict[str, Any]) -> bool:
+        """Whether one queued message was aimed at the bot: an @ or a reply to it.
+
+        A swipe-reply that quotes the bot is addressed traffic even though
+        ``is_at_bot`` is False for it. Treating it as ordinary chatter let a burst of
+        group noise evict the one message the user was waiting on.
+        """
+        return bool(msg.get("is_at_bot") or msg.get("is_reply_to_bot"))
 
     def _evict_inbound_for(self, incoming: dict[str, Any]) -> Optional[str]:
         """Free one queue slot for ``incoming``, protecting bot-addressed messages.
@@ -1181,11 +1323,11 @@ class QQOpenPlatformConnection(QQOpenPlatformMediaMixin, ConnectionBase):
                 pass
             return ""
         for index, queued in enumerate(items):
-            if isinstance(queued, dict) and not queued.get("is_at_bot"):
+            if isinstance(queued, dict) and not self._is_addressed(queued):
                 victim = items[index]
                 del items[index]
                 return str(victim.get("message_id") or "")
-        if not (isinstance(incoming, dict) and incoming.get("is_at_bot")):
+        if not (isinstance(incoming, dict) and self._is_addressed(incoming)):
             return None
         victim = items[0]
         del items[0]
@@ -2064,7 +2206,18 @@ class QQOpenPlatformConnection(QQOpenPlatformMediaMixin, ConnectionBase):
             # Authorization header.
             async with self._mutable("_token_lock", asyncio.Lock):
                 self._token_expires_at = 0
-                await self._refresh_token()
+                try:
+                    await self._refresh_token()
+                except QQOpenPlatformAPIError:
+                    raise
+                except Exception as exc:
+                    # The first token call of _api is wrapped; this one was not. A
+                    # transport or JSON failure here escaped as a raw httpx error, and
+                    # the media senders catch only the classified type, so a public
+                    # voice send raised instead of answering its documented None.
+                    raise QQOpenPlatformAPIError(
+                        method="POST", path=path,
+                        message=f"token refresh failed: {exc}") from exc
             return await self._api(
                 method, path, params=params, payload=payload, retry_on_token=False)
         if err_code in ERR_GROUP_MUTED:
@@ -2078,7 +2231,8 @@ class QQOpenPlatformConnection(QQOpenPlatformMediaMixin, ConnectionBase):
             message=str(body.get("message") or ""), trace_id=str(body.get("trace_id") or ""))
 
     async def _upload_media(
-        self, *, scope: str, owner_id: str, source: str, file_type: int
+        self, *, scope: str, owner_id: str, source: str, file_type: int,
+        file_name: str = "",
     ) -> str:
         """Upload one rich-media item and return ``file_info`` (``""`` when it failed).
 
@@ -2111,10 +2265,14 @@ class QQOpenPlatformConnection(QQOpenPlatformMediaMixin, ConnectionBase):
                             f"{UPLOAD_HARD_MAX_BYTES} 上限，未解码即拒绝")
                     return ""
                 decoded = await asyncio.to_thread(_decode_base64_source, encoded)
-                raw, file_name = decoded.payload, decoded.file_name
+                raw = decoded.payload
+                # An explicit name wins over the magic-table guess: base64 upload of
+                # report.pdf came out named image.png, and the platform stores that
+                # name in the file metadata the recipient then sees.
+                file_name = file_name or decoded.file_name
             else:
                 path = _local_path(source)
-                file_name = path.replace("\\", "/").rsplit("/", 1)[-1]
+                file_name = file_name or path.replace("\\", "/").rsplit("/", 1)[-1]
                 try:
                     # Capped: the old version read the whole file first and checked the
                     # size after, so a 2 GB path put 2 GB in memory to be refused.
@@ -2172,10 +2330,11 @@ class QQOpenPlatformConnection(QQOpenPlatformMediaMixin, ConnectionBase):
 
     async def _send_media(
         self, *, scope: str, owner_id: str, file_type: int, source: str,
-        reply_message_id: str = "", record_sent: bool = True,
+        reply_message_id: str = "", record_sent: bool = True, file_name: str = "",
     ) -> Optional[str]:
         file_info = await self._upload_media(
-            scope=scope, owner_id=owner_id, source=source, file_type=file_type)
+            scope=scope, owner_id=owner_id, source=source, file_type=file_type,
+            file_name=file_name)
         if not file_info:
             return None
         payload: dict[str, Any] = {"msg_type": 7, "media": {"file_info": file_info}}
@@ -2641,7 +2800,8 @@ class QQOpenPlatformConnection(QQOpenPlatformMediaMixin, ConnectionBase):
         if not gid:
             return self._missing_argument("upload_group_file", "group_id", empty=dict)
         mid = await self._send_media(
-            scope="groups", owner_id=gid, file_type=FILE_TYPE_FILE, source=str(file or ""))
+            scope="groups", owner_id=gid, file_type=FILE_TYPE_FILE,
+            source=str(file or ""), file_name=str(name or ""))
         return {"file_id": mid, "id": mid} if mid else {}
 
     async def upload_private_file(self, file: str = "", name: str = "", **kw: Any) -> dict:
@@ -2649,7 +2809,8 @@ class QQOpenPlatformConnection(QQOpenPlatformMediaMixin, ConnectionBase):
         if not uid:
             return self._missing_argument("upload_private_file", "user_id", empty=dict)
         mid = await self._send_media(
-            scope="users", owner_id=uid, file_type=FILE_TYPE_FILE, source=str(file or ""))
+            scope="users", owner_id=uid, file_type=FILE_TYPE_FILE,
+            source=str(file or ""), file_name=str(name or ""))
         return {"file_id": mid, "id": mid} if mid else {}
 
     async def get_menu(self) -> dict:
