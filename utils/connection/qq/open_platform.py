@@ -62,6 +62,10 @@ _SEEN_GROUPS_TTL = 30 * 24 * 3600
 #: ``file_data`` (inline binary upload) size ceiling; above it URL/chunked upload is
 #: required. shortcut: inline upload only, >5 MB falls back to the URL path.
 INLINE_UPLOAD_MAX_BYTES = 5 * 1024 * 1024
+#: Hard ceiling for any single rich-media upload, inline or chunked. Voice and file
+#: accept 200 MB per the media docs; this is also the read cap, so a caller pointing at
+#: an oversized file cannot make the process hold more than this in memory.
+UPLOAD_HARD_MAX_BYTES = 200 * 1024 * 1024
 
 
 class QQOpenPlatformAPIError(RuntimeError):
@@ -123,6 +127,14 @@ _MSG_SEQ_TTL_SECONDS = 2 * 60 * 60
 _INBOUND_DEDUP_TTL_SECONDS = 60.0
 #: Prune the dedup table only once it grows past this, so the common path stays O(1).
 _INBOUND_DEDUP_PRUNE_AT = 256
+
+#: How long one notice-sink callback may take before the connector gives up on it, and
+#: how many such callbacks may be outstanding at once. Both bound the same failure:
+#: sinks run detached now (so a slow one cannot stall the receive loop), and detached
+#: work needs a ceiling of its own or a hanging consumer turns a notification burst
+#: into an unbounded task pile.
+_NOTICE_SINK_TIMEOUT_SECONDS = 10.0
+_NOTICE_SINK_MAX_TASKS = 32
 
 # ==========================================
 # R11 identity scope: resolved
@@ -406,6 +418,11 @@ class QQOpenPlatformConnection(QQOpenPlatformMediaMixin, ConnectionBase):
         #: Inbound ids accepted recently -> the monotonic time they arrived. Guards
         #: against the platform delivering one message twice (see ``_enqueue_inbound``).
         self._seen_inbound_ids: dict[str, float] = {}
+        #: Detached notice-sink tasks, so a slow listener cannot stall the receive
+        #: loop (see ``_fan_out_notice``). Cleared on disconnect.
+        self._sink_tasks: set = set()
+        #: One token refresh at a time (see ``_api``).
+        self._token_lock: Optional[asyncio.Lock] = None
         #: Groups this connection actually saw a message from; the platform offers no
         #: "my groups" listing, so observed ids are the only honest answer.
         self._seen_groups: dict[str, float] = {}
@@ -493,7 +510,15 @@ class QQOpenPlatformConnection(QQOpenPlatformMediaMixin, ConnectionBase):
 
     @property
     def supports_reference_messages(self) -> bool:
-        """Visible quoting via ``message_reference`` (needs the REFIDX token)."""
+        """Whether the connector can see a quote the user made, not create one.
+
+        Receive side works: ``message_reference.message_id`` is read and matched
+        against the ids this connection sent, so ``is_reply_to_bot`` and
+        ``quoted_message_id`` are real. Send side does not: building a visible quote
+        needs a ``REFIDX`` token that only arrives on ``INTERACTION_CREATE``, which
+        needs the interaction intent (1<<26) the platform has not granted this bot.
+        A consumer that wants to *emit* quotes must check that separately.
+        """
         return True
 
     @property
@@ -627,6 +652,11 @@ class QQOpenPlatformConnection(QQOpenPlatformMediaMixin, ConnectionBase):
         # is "stop, then start" -- deterministic, never a mid-flight split.
         self._pinned_api_base = None
         self._cancel_inbound_sink_tasks()
+        # Detached notice sinks belong to this connection: leaving them running past a
+        # stop means a callback lands in the UI after the user pressed stop.
+        for task in list(self._mutable("_sink_tasks", set)):
+            task.cancel()
+        self._sink_tasks.clear()
         for task in [self._heartbeat_task, self._receive_task]:
             if task and not task.done():
                 task.cancel()
@@ -788,14 +818,91 @@ class QQOpenPlatformConnection(QQOpenPlatformMediaMixin, ConnectionBase):
                 self.logger.info(f"[QQOpenPlatform] 未处理的官方事件: {event_type}")
             return
         payload = self._normalize_notice(event_type, data, envelope_id)
+        self._apply_notice_state(event_type, payload)
+        self._fan_out_notice(event_type, payload)
+
+    def _apply_notice_state(self, event_type: str, payload: dict) -> None:
+        """Keep the reception-mode proof in step with what the group just did.
+
+        ``receives_all_messages`` and ``needs_attention`` used to be one-way latches:
+        the first ``GROUP_MESSAGE_CREATE`` set them and nothing ever cleared them, not
+        even ``GROUP_MSG_REJECT``, ``GROUP_DEL_ROBOT`` or a reconnect. A group that
+        turned push off kept being advertised as full-push for the life of the
+        connection, and the consumer kept paying for attention arbitration on a channel
+        that now only delivers @mentions.
+
+        State is per group, so the reset is per group too: being removed from one group
+        must not revoke the proof another group already gave.
+        """
+        gid = str(payload.get("group_id") or "").strip()
+        if event_type == "GROUP_MSG_RECEIVE" and gid:
+            self._mutable("_recv_msg_setting_by_group", dict)[gid] = "all"
+            return
+        if event_type == "GROUP_MSG_REJECT" and gid:
+            self._mutable("_recv_msg_setting_by_group", dict)[gid] = "only_mention"
+            self._mutable("_all_messages_observed_groups", set).discard(gid)
+            return
+        if event_type == "GROUP_DEL_ROBOT" and gid:
+            # Out of this group: nothing it once proved still applies.
+            self._mutable("_recv_msg_setting_by_group", dict).pop(gid, None)
+            self._mutable("_all_messages_observed_groups", set).discard(gid)
+            self._mutable("_bot_openid_by_group", dict).pop(gid, None)
+            self._mutable("_seen_groups", dict).pop(gid, None)
+            self._mutable("_bot_member_role_by_group", dict).pop(gid, None)
+
+    def _fan_out_notice(self, event_type: str, payload: dict) -> None:
+        """Hand one notice to every sink without waiting on any of them.
+
+        The sinks used to be awaited in place, inside the single ``_receive_loop``
+        task. One listener that waits on a slow HTTP call therefore stopped the
+        connector from reading the *next* message, and a listener that never returned
+        stopped it for good -- catching the exception cannot help, because nothing was
+        ever raised. Catching is still needed (a broken consumer must not drop the
+        transport), so it moved into the task wrapper.
+
+        Coroutines go out as detached tasks; anything a sink returns synchronously
+        still runs inline, since by definition it already returned.
+        """
         for sink in list(self._mutable("_event_sinks", list)):
             try:
                 result = sink(event_type, payload)
-                if asyncio.iscoroutine(result):
-                    await result
             except Exception as exc:  # a broken consumer must not drop the transport
                 if self.logger:
                     self.logger.warning(f"[QQOpenPlatform] 事件监听器异常({event_type}): {exc}")
+                continue
+            if not asyncio.iscoroutine(result):
+                continue
+            tasks = self._mutable("_sink_tasks", set)
+            if len(tasks) >= _NOTICE_SINK_MAX_TASKS:
+                # Bounded on purpose: a sink that never finishes must not turn a
+                # traffic burst into an unbounded task pile. Dropping the newest
+                # notification is visible in the log; blocking the loop is not.
+                result.close()
+                if self.logger:
+                    self.logger.warning(
+                        f"[QQOpenPlatform] 事件监听任务已满（{_NOTICE_SINK_MAX_TASKS}），"
+                        f"丢弃 {event_type} 的一次通知"
+                    )
+                continue
+            task = asyncio.create_task(self._await_notice_sink(result, event_type, sink))
+            tasks.add(task)
+            task.add_done_callback(tasks.discard)
+
+    async def _await_notice_sink(self, coro, event_type: str, sink) -> None:
+        """Await one detached sink with its own deadline."""
+        try:
+            async with asyncio.timeout(_NOTICE_SINK_TIMEOUT_SECONDS):
+                await coro
+        except asyncio.TimeoutError:
+            if self.logger:
+                self.logger.warning(
+                    f"[QQOpenPlatform] 事件监听器超时({event_type}, "
+                    f"{_NOTICE_SINK_TIMEOUT_SECONDS}s)，已放弃等待该通知")
+        except asyncio.CancelledError:
+            raise
+        except Exception as exc:
+            if self.logger:
+                self.logger.warning(f"[QQOpenPlatform] 事件监听器异常({event_type}): {exc}")
 
     def _normalize_notice(self, event_type: str, data: dict, envelope_id: str) -> dict:
         """Common shape for non-message events (``channel`` matches ``CHANNEL``)."""
@@ -1093,6 +1200,14 @@ class QQOpenPlatformConnection(QQOpenPlatformMediaMixin, ConnectionBase):
             if time.time() < until:
                 return True
             muted.pop(gid, None)
+        # A group can be muted as a whole (``global_rule`` in the shut list) without
+        # any per-member record. That rule was stored and never read, so ``is_group_muted``
+        # answered False for a group nobody could post in, and the caller kept paying
+        # for sends the platform was going to reject.
+        rule = self._mutable("_shut_global_rule", dict).get(gid) or {}
+        mode = str(rule.get("mode") or "").strip().lower()
+        if mode in ("always", "global", "all"):
+            return True
         return False
 
     async def receive_message(self, timeout: float = 1.0) -> Optional[dict[str, Any]]:
@@ -1571,10 +1686,20 @@ class QQOpenPlatformConnection(QQOpenPlatformMediaMixin, ConnectionBase):
                 "appId": self._app_id,
                 "clientSecret": self._client_secret,
             })
-            data = resp.json()
-            self._access_token = str(data.get("access_token") or "")
+            data = resp.json() if isinstance(resp.json(), dict) else {}
+            token = str(data.get("access_token") or "")
+            if not token:
+                # A parseable body is not a token. Accepting the error shape here set
+                # ``_access_token`` to "" and pushed the expiry two hours out, so every
+                # call for that window carried an empty Authorization header and the
+                # connector looked connected while nothing could send.
+                raise QQOpenPlatformAPIError(
+                    method="POST", path="/token",
+                    err_code=_to_int(data.get("err_code") or data.get("code")),
+                    message=f"token endpoint returned no access_token: {str(data)[:200]}")
+            self._access_token = token
             expires_in = int(data.get("expires_in") or 7200)
-            self._token_expires_at = time.time() + expires_in - 300  # refresh 5 min early
+            self._token_expires_at = time.time() + max(60, expires_in) - 300
             if self.logger:
                 self.logger.info("[QQOpenPlatform] access_token 已获取")
         except Exception as e:
@@ -1605,12 +1730,10 @@ class QQOpenPlatformConnection(QQOpenPlatformMediaMixin, ConnectionBase):
         )
 
     async def _get_gateway_url(self) -> str:
-        await self._ensure_token()
-        resp = await self._http.get(
-            f"{self._API_BASE}/gateway/bot",
-            headers=self._auth_headers(),
-        )
-        data = resp.json()
+        # Through _api, like every other v2 call: the raw form had no err_code check,
+        # no trace_id and no token retry, so a permission or rate failure on the
+        # lifecycle path surfaced as a bare transport error.
+        data = await self._api("GET", "/gateway/bot")
         return str(data.get("url") or f"{self._API_BASE}/websocket")
 
     async def _heartbeat_loop(self) -> None:
@@ -1833,7 +1956,17 @@ class QQOpenPlatformConnection(QQOpenPlatformMediaMixin, ConnectionBase):
         """
         from urllib.parse import urlencode
 
-        await self._ensure_token()
+        try:
+            await self._ensure_token()
+        except Exception as exc:
+            # The token calls used to sit outside the guard, so a token failure left
+            # _api as a raw httpx error. Callers that degrade (media send returns None
+            # and the reply falls back to text) only work when the error is the type
+            # they catch.
+            if isinstance(exc, QQOpenPlatformAPIError):
+                raise
+            raise QQOpenPlatformAPIError(
+                method=method, path=path, message=f"token unavailable: {exc}") from exc
         query = {k: v for k, v in (params or {}).items() if v not in (None, "")}
         url = f"{self._API_BASE}{path}" + (f"?{urlencode(query)}" if query else "")
         headers = self._auth_headers()
@@ -1853,9 +1986,13 @@ class QQOpenPlatformConnection(QQOpenPlatformMediaMixin, ConnectionBase):
         if 200 <= status < 300 and not err_code:
             return body
         if err_code == ERR_TOKEN_INVALID and retry_on_token:
-            self._access_token = ""
-            self._token_expires_at = 0
-            await self._refresh_token()
+            # One refresher at a time, and the old value is replaced rather than
+            # blanked: two concurrent sends that both saw 40011027 used to clear the
+            # shared token and then fire, so the second one posted an empty
+            # Authorization header.
+            async with self._mutable("_token_lock", asyncio.Lock):
+                self._token_expires_at = 0
+                await self._refresh_token()
             return await self._api(
                 method, path, params=params, payload=payload, retry_on_token=False)
         if err_code in ERR_GROUP_MUTED:
@@ -1873,9 +2010,10 @@ class QQOpenPlatformConnection(QQOpenPlatformMediaMixin, ConnectionBase):
     ) -> str:
         """Upload one rich-media item and return ``file_info`` (``""`` when it failed).
 
-        Two documented paths only: URL hand-off, and inline binary (``file_data``,
-        up to 5 MB). shortcut: no chunked upload here; anything larger is refused with a
-        log line, and the upgrade is ``upload_prepare``/``upload_part_finish``.
+        Three documented shapes: URL hand-off, inline binary (``file_data``, up to
+        5 MB), and the chunked protocol (``upload_prepare`` / ``upload_part_finish``)
+        for anything larger. ``_media_upload_chunked`` comes from the media mixin, which
+        already used it for images; the local branch was the one that stopped at 5 MB.
         """
         source = str(source or "").strip()
         if not source:
@@ -1896,7 +2034,9 @@ class QQOpenPlatformConnection(QQOpenPlatformMediaMixin, ConnectionBase):
                 path = _local_path(source)
                 file_name = path.replace("\\", "/").rsplit("/", 1)[-1]
                 try:
-                    raw = await asyncio.to_thread(_read_bytes, path)
+                    # Capped: the old version read the whole file first and checked the
+                    # size after, so a 2 GB path put 2 GB in memory to be refused.
+                    raw = await asyncio.to_thread(_read_bytes, path, UPLOAD_HARD_MAX_BYTES)
                 except Exception as exc:
                     if self.logger:
                         self.logger.warning(f"[QQOpenPlatform] 富媒体读取失败: {exc}")
@@ -1905,12 +2045,27 @@ class QQOpenPlatformConnection(QQOpenPlatformMediaMixin, ConnectionBase):
                 if self.logger:
                     self.logger.warning(f"[QQOpenPlatform] 富媒体内容为空或读不到: {_brief(source)}")
                 return ""
-            if len(raw) > INLINE_UPLOAD_MAX_BYTES:
+            if len(raw) > UPLOAD_HARD_MAX_BYTES:
                 if self.logger:
                     self.logger.warning(
-                        f"[QQOpenPlatform] 富媒体 {len(raw)} 字节超过内联上传上限，"
-                        "需要改走分片上传")
+                        f"[QQOpenPlatform] 富媒体超过 {UPLOAD_HARD_MAX_BYTES} 字节硬上限，"
+                        f"拒绝上传: {_brief(source)}")
                 return ""
+            if len(raw) > INLINE_UPLOAD_MAX_BYTES:
+                # The inline form (``file_data``) tops out at 5 MB, but the platform
+                # also documents a chunked protocol, which the media mixin already
+                # implements for images. Routing voice and file there is what makes a
+                # minute of audio sendable at all: one minute of 44.1 kHz stereo WAV is
+                # about 10 MB, and refusing it was the whole reason the voice feature
+                # looked dead on a real recording.
+                try:
+                    return await self._media_upload_chunked(
+                        scope=scope, owner_id=owner_id, payload=raw,
+                        file_name=file_name, file_type=int(file_type))
+                except QQOpenPlatformAPIError as exc:
+                    if self.logger:
+                        self.logger.warning(f"[QQOpenPlatform] 分片上传失败: {exc}")
+                    return ""
             body = {
                 "file_type": int(file_type),
                 "file_name": file_name,
@@ -1968,11 +2123,11 @@ class QQOpenPlatformConnection(QQOpenPlatformMediaMixin, ConnectionBase):
                 "description": str(raw.get("description") or raw.get("desc") or ""),
                 "url": str(raw.get("url") or ""),
                 "pic_url": str(raw.get("pic_url") or raw.get("img") or "")}
-        # Non-https links are rejected by the platform; fix the scheme instead of
-        # silently dropping the fields the caller asked for.
+        # The platform rejects plain-http card links, so the scheme gets upgraded --
+        # by *replacing* an existing one. Prefixing instead produced
+        # "https://http://a.example/x": the card rendered, the link went nowhere.
         for key in ("url", "pic_url"):
-            if content[key] and not content[key].startswith("https://"):
-                content[key] = "https://" + content[key].lstrip("/")
+            content[key] = _https_link(content[key])
         if not content["description"]:
             content["description"] = content["title"]
         return {"type": "tuwen", "content": content}
@@ -2213,10 +2368,26 @@ class QQOpenPlatformConnection(QQOpenPlatformMediaMixin, ConnectionBase):
             group_id=str(kw.get("group_id") or ""), user_id=str(kw.get("user_id") or ""))
         return {"status": "ok"}
 
+    def _missing_argument(self, operation: str, missing: str, *, empty: type = dict):
+        """Refuse one operation whose target id did not arrive, out loud.
+
+        The pattern this replaces was ``return {}`` with no comment: an empty dict does
+        not raise, so a caller that only checks for an exception reads it as success.
+        That is the same silent-success shape this change set went to remove, moved
+        from "unsupported operation" to "caller passed nothing to act on".
+
+        Returning the empty container keeps the documented return type and the caller's
+        ``.get(...)`` working; the log line is what was missing.
+        """
+        if self.logger:
+            self.logger.warning(
+                f"[QQOpenPlatform] {operation} 缺少参数 {missing}，未执行任何操作")
+        return empty()
+
     async def get_group_info(self, group_id: str = "", **_: Any) -> dict:
         gid = str(group_id or "").strip()
         if not gid:
-            return {}
+            return self._missing_argument("get_group_info", "group_id", empty=dict)
         return await self._api("GET", f"/v2/groups/{gid}/info")
 
     async def get_group_bot_state(self, group_id: str, *, force: bool = False) -> dict:
@@ -2228,7 +2399,7 @@ class QQOpenPlatformConnection(QQOpenPlatformMediaMixin, ConnectionBase):
         """
         gid = str(group_id or "").strip()
         if not gid:
-            return {}
+            return self._missing_argument("get_group_bot_state", "group_id", empty=dict)
         state = await self._api("GET", f"/v2/groups/{gid}/bot_state")
         # Per group: the reception setting, the role and the group-side openid are all
         # conversation facts. Storing them connection-wide let one group's admin role
@@ -2246,14 +2417,14 @@ class QQOpenPlatformConnection(QQOpenPlatformMediaMixin, ConnectionBase):
         gid = str(group_id or "").strip()
         member = str(user_id or "").strip()
         if not gid or not member:
-            return {}
+            return self._missing_argument("get_group_member_info", "group_id/user_id", empty=dict)
         return await self._api("GET", f"/v2/groups/{gid}/members/{member}")
 
     async def get_group_member_list(self, group_id: str = "", **kw: Any) -> list:
         """Page through members (30 at a time) until the cursor runs out or max_pages hits."""
         gid = str(group_id or "").strip()
         if not gid:
-            return []
+            return self._missing_argument("get_group_member_list", "group_id", empty=list)
         pages = max(1, min(_to_int(kw.get("max_pages")) or 10, 20))
         out: list = []
         cursor = ""
@@ -2270,7 +2441,7 @@ class QQOpenPlatformConnection(QQOpenPlatformMediaMixin, ConnectionBase):
         gid = str(group_id or "").strip()
         member = str(user_id or "").strip()
         if not gid or not member:
-            return {}
+            return self._missing_argument("set_group_ban", "group_id/user_id", empty=dict)
         seconds = _to_int(duration)
         op = "del"
         if seconds > 0:
@@ -2316,7 +2487,7 @@ class QQOpenPlatformConnection(QQOpenPlatformMediaMixin, ConnectionBase):
         gid = str(group_id or "").strip()
         member = str(user_id or "").strip()
         if not gid or not member:
-            return {}
+            return self._missing_argument("set_group_kick", "group_id/user_id", empty=dict)
         body: dict[str, Any] = {"member_openids": [member]}
         if kw.get("add_to_member_blacklist") or kw.get("reject_add_request"):
             body["add_to_member_blacklist"] = True
@@ -2325,13 +2496,21 @@ class QQOpenPlatformConnection(QQOpenPlatformMediaMixin, ConnectionBase):
     async def list_group_join_requests(self, group_id: str = "", cursor: str = "", limit: int = 20, **_: Any) -> dict:
         gid = str(group_id or "").strip()
         if not gid:
-            return {}
+            return self._missing_argument("list_group_join_requests", "group_id", empty=dict)
         return await self._api(
             "GET", f"/v2/groups/{gid}/join_request_list",
             params={"cursor": cursor, "limit": max(1, min(_to_int(limit) or 20, 50))})
 
-    async def set_group_add_request(self, flag: str = "", approve: bool = True, reason: str = "", **kw: Any) -> dict:
+    async def set_group_add_request(
+        self, flag: str = "", sub_type: str = "", approve: bool = True,
+        reason: str = "", **kw: Any,
+    ) -> dict:
         """Approve or decline one join request; ``list_group_join_requests`` supplies the ids.
+
+        ``sub_type`` is not a v2 concept. It stays in the signature in the OneBot
+        position because callers written against that connector pass it positionally,
+        and dropping it would bind ``"add"`` to ``approve`` -- a truthy string -- so a
+        DECLINE request would silently APPROVE the applicant.
 
         Join-request *events* need the GROUP_MEMBER_EVENT intent, off unless
         ``extra_intents`` opts in, so approvals are pulled rather than pushed.
@@ -2339,7 +2518,7 @@ class QQOpenPlatformConnection(QQOpenPlatformMediaMixin, ConnectionBase):
         gid = str(kw.get("group_id") or kw.get("group_openid") or "").strip()
         member = str(kw.get("user_id") or kw.get("member_openid") or "").strip()
         if not gid or not member:
-            return {}
+            return self._missing_argument("set_group_add_request", "group_openid/user_id", empty=dict)
         body: dict[str, Any] = {
             "op": "approve" if approve else "decline", "join_request_id": str(flag or "")}
         if not approve:
@@ -2355,21 +2534,21 @@ class QQOpenPlatformConnection(QQOpenPlatformMediaMixin, ConnectionBase):
         gid = str(group_id or "").strip()
         ids = [str(x).strip() for x in (member_openids or []) if str(x).strip()][:20]
         if not gid or not ids or op not in ("add", "del"):
-            return {}
+            return self._missing_argument("operate_group_member_blacklist", "group_id/member_openids/op", empty=dict)
         return await self._api(
             "POST", f"/v2/groups/{gid}/member_blacklist", payload={"op": op, "member_openids": ids})
 
     async def list_group_member_blacklist(self, group_id: str, cursor: str = "") -> dict:
         gid = str(group_id or "").strip()
         if not gid:
-            return {}
+            return self._missing_argument("list_group_member_blacklist", "group_id", empty=dict)
         return await self._api("GET", f"/v2/groups/{gid}/member_blacklist", params={"cursor": cursor})
 
     async def upload_group_file(self, file: str = "", name: str = "", **kw: Any) -> dict:
         """Send a group file (``file_type=4``). Upload-only: v2 has no file management."""
         gid = str(kw.get("group_id") or kw.get("group_openid") or "").strip()
         if not gid:
-            return {}
+            return self._missing_argument("upload_group_file", "group_id", empty=dict)
         mid = await self._send_media(
             scope="groups", owner_id=gid, file_type=FILE_TYPE_FILE, source=str(file or ""))
         return {"file_id": mid, "id": mid} if mid else {}
@@ -2377,7 +2556,7 @@ class QQOpenPlatformConnection(QQOpenPlatformMediaMixin, ConnectionBase):
     async def upload_private_file(self, file: str = "", name: str = "", **kw: Any) -> dict:
         uid = str(kw.get("user_id") or kw.get("openid") or "").strip()
         if not uid:
-            return {}
+            return self._missing_argument("upload_private_file", "user_id", empty=dict)
         mid = await self._send_media(
             scope="users", owner_id=uid, file_type=FILE_TYPE_FILE, source=str(file or ""))
         return {"file_id": mid, "id": mid} if mid else {}
@@ -2396,7 +2575,7 @@ class QQOpenPlatformConnection(QQOpenPlatformMediaMixin, ConnectionBase):
         """Answer an INTERACTION_CREATE; the platform expects it within about 3 seconds."""
         iid = str(interaction_id or "").strip()
         if not iid:
-            return {}
+            return self._missing_argument("respond_interaction", "interaction_id", empty=dict)
         await self._api("PUT", f"/interactions/{iid}", payload={"code": _to_int(code)})
         return {"status": "ok", "interaction_id": iid}
 
@@ -2440,12 +2619,54 @@ def _group_id_of(path: str) -> str:
     return match.group(1) if match else ""
 
 
-def _read_bytes(path: str) -> bytes:
-    """Blocking read; callers run it in a thread so a slow disk cannot stall the loop."""
+def _https_link(value: Any) -> str:
+    """Force one card link onto https, replacing an existing scheme.
+
+    The platform refuses plain-http card links, so a caller that hands over
+    ``http://a.example/x`` still wants a working card. Three rules, each learned from a
+    way the old prefixing code produced a link that went nowhere:
+
+    - an existing ``http:`` / ``https:`` scheme is rewritten, never stacked, so
+      ``http://a`` gives ``https://a`` and not ``https://http://a``;
+    - a protocol-relative ``//host/path`` gets https, because the caller left the
+      scheme out on purpose rather than naming a wrong one;
+    - any other scheme (``javascript:``, ``data:``, a bare word) yields ``""``: the
+      platform rejects those anyway, and an empty field degrades the card while a
+      stacked string pretends the link works.
+    """
+    link = str(value or "").strip()
+    if not link:
+        return ""
+    lowered = link.lower()
+    if lowered.startswith("https://"):
+        return link
+    if lowered.startswith("http://"):
+        return "https://" + link[len("http://"):]
+    if link.startswith("//"):
+        return "https:" + link
+    head = link.split("/", 1)[0]
+    if not head or ":" in head:
+        # Either an absolute path with no host at all (``/a/b``, nothing to prepend a
+        # host to), or some other scheme (``javascript:``, ``data:``, ``ftp:``) or a
+        # bare host:port. The platform refuses the schemes outright, so these become
+        # empty: the card degrades to "no jump target", which is visible, instead of a
+        # stacked string that looks like it works.
+        return ""
+    return "https://" + link
+
+
+def _read_bytes(path: str, limit: int = 0) -> bytes:
+    """Blocking read; callers run it in a thread so a slow disk cannot stall the loop.
+
+    ``limit`` caps how much is taken. Without a cap a caller could hand over a 2 GB file
+    and the whole thing would land in memory *before* the size check that rejects it --
+    the refusal never protected anything. One extra byte is read so the caller can tell
+    "exactly at the limit" from "over the limit".
+    """
     if not path or not os.path.isfile(path):
         return b""
     with open(path, "rb") as handle:
-        return handle.read()
+        return handle.read(limit + 1) if limit > 0 else handle.read()
 
 
 def _rfc3339_in(seconds: int) -> str:

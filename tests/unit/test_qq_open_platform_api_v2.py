@@ -23,6 +23,7 @@ import json
 
 import pytest
 
+from utils.connection.qq import open_platform as mod
 from utils.connection.qq.open_platform import (
     QQOpenPlatformAPIError,
     QQOpenPlatformConnection,
@@ -510,21 +511,155 @@ def test_send_group_poke_answers_false_rather_than_raising():
 
 
 def test_stubs_are_gone_from_the_surface():
-    """No operation may still answer ``{}`` because it has nothing to say.
+    """No public operation may answer a bare empty literal, anywhere in its body.
 
     A silent empty dict is what made these look successful: mute detection read
     ``shut_up_timestamp`` out of an empty dict and never fired, reactions looked sent.
+
+    The first version of this gate looked only at the *last* line of each function, so
+    it passed while thirteen methods still ``return {}`` on their missing-argument
+    guard -- a return that is not last is the common case. It now walks the syntax tree,
+    so any empty literal anywhere in any public coroutine trips it.
     """
-    conn = _conn()
+    import ast
     import inspect
 
-    suspicious = []
-    for name, member in inspect.getmembers(QQOpenPlatformConnection, inspect.iscoroutinefunction):
-        if name.startswith("_"):
-            # 内部辅助允许空响应（open_platform_media._media_post 有文档说明）；
-            # 门禁只管对外操作面。
+    tree = ast.parse(inspect.getsource(mod))
+    flagged: list[str] = []
+    for node in ast.walk(tree):
+        if not isinstance(node, (ast.AsyncFunctionDef, ast.FunctionDef)):
             continue
-        source = inspect.getsource(member)
-        if source.strip().endswith("return {}") or source.strip().endswith("return []"):
-            suspicious.append(name)
-    assert not suspicious, f"仍然只回空值的方法: {suspicious}"
+        if node.name.startswith("_"):
+            # Internal helpers may answer empty (open_platform_media._media_post is
+            # documented); the gate guards the outward operation surface.
+            continue
+        for ret in ast.walk(node):
+            if not isinstance(ret, ast.Return) or ret.value is None:
+                continue
+            if isinstance(ret.value, (ast.Dict, ast.List)) and not ret.value.keys                     and not ret.value.elts:
+                flagged.append(f"{node.name}:{ret.lineno}")
+    assert not flagged, f"仍然静默回空值的方法: {flagged}"
+
+
+def test_missing_target_ids_are_refused_out_loud():
+    # The guard used to be a bare ``return {}``: the caller saw a success-shaped value
+    # and nothing in the log said why the operation did nothing.
+    conn = _conn()
+    logs: list[str] = []
+    conn.logger = type("L", (), {"warning": staticmethod(lambda m: logs.append(str(m))),
+                                 "info": staticmethod(lambda m: None)})()
+    assert run(conn.set_group_ban("", "M1", 600)) == {}
+    assert run(conn.get_group_member_info("G1", "")) == {}
+    assert run(conn.get_group_member_list("")) == []
+    assert run(conn.respond_interaction("")) == {}
+    assert len(logs) == 4
+    assert all("缺少参数" in line for line in logs), logs
+
+
+# ── round-3 follow-ups: card links, mute truth, token truth, size routing ──
+
+def test_card_links_replace_the_scheme_instead_of_stacking_it():
+    # The old normaliser prefixed https:// onto whatever it got, so http:// became
+    # "https://http://..." -- a card that renders and links nowhere.
+    conn = _conn()
+    card = conn._card_message_payload({
+        "content": {"title": "t", "url": "http://a.example/x", "pic_url": "http://cdn/y.png"}})
+    assert card["content"]["url"] == "https://a.example/x"
+    assert card["content"]["pic_url"] == "https://cdn/y.png"
+
+
+def test_card_link_normalisation_covers_the_other_shapes():
+    conn = _conn()
+    def norm(url):
+        return conn._card_message_payload({"content": {"title": "t", "url": url}})["content"]["url"]
+    assert norm("https://a.example/x") == "https://a.example/x"   # already good
+    assert norm("//a.example/x") == "https://a.example/x"          # protocol-relative
+    assert norm("a.example/x") == "https://a.example/x"            # bare host
+    assert norm("") == ""                                          # nothing to fix
+    # A javascript: or data: link is refused by the platform anyway; the card loses the
+    # link rather than pretending the link works.
+    assert norm("javascript:alert(1)") == ""
+    assert norm("data:text/html,x") == ""
+
+
+def test_whole_group_mute_is_reported_even_without_a_per_member_record():
+    # The PR stores global_rule and the reviewer's point was that nothing read it.
+    conn = _conn()
+    assert conn.is_group_muted("G1") is False
+    conn._shut_global_rule = {"G1": {"mode": "always"}}
+    assert conn.is_group_muted("G1") is True
+    assert conn.is_group_muted("G2") is False
+
+
+def test_token_response_without_a_token_is_an_error_not_an_empty_credential():
+    # Accepting a parseable body as success used to blank the token and push the
+    # expiry out, so every call for hours carried an empty Authorization header.
+    conn = _conn([_Response({"err_code": 11252, "message": "appid or secret invalid"})])
+    conn._token_expires_at = 0
+    with pytest.raises(QQOpenPlatformAPIError):
+        run(conn._refresh_token())
+    assert conn._access_token == "t"          # the old value is still there
+    assert conn._token_expires_at == 0        # and nothing promised a fresh window
+
+
+def test_gateway_url_failure_is_a_classified_error():
+    # The last REST call on the lifecycle path that bypassed the error layer.
+    conn = _conn([_Response({"err_code": 40030011, "message": "no scope",
+                             "trace_id": "T-77"}, 403)])
+    with pytest.raises(QQOpenPlatformAPIError) as got:
+        run(conn._get_gateway_url())
+    assert got.value.trace_id == "T-77"
+    assert got.value.err_code == 40030011
+
+
+def test_oversized_local_voice_goes_through_the_chunked_protocol(tmp_path, monkeypatch):
+    # One minute of 44.1 kHz stereo WAV is about 10 MB, over the 5 MB inline cap.
+    # Refusing it was the reason voice looked dead on any real recording.
+    seen = {}
+
+    async def fake_chunked(*, scope, owner_id, payload, file_name, file_type):
+        seen.update(scope=scope, owner_id=owner_id, size=len(payload),
+                    file_name=file_name, file_type=file_type)
+        return "FI-big"
+
+    conn = _conn()
+    monkeypatch.setattr(conn, "_media_upload_chunked", fake_chunked)
+    monkeypatch.setattr("utils.connection.qq.open_platform.INLINE_UPLOAD_MAX_BYTES", 4)
+    voice = tmp_path / "long.wav"
+    voice.write_bytes(b"RIFF" + b"0" * 40)
+    assert run(conn._upload_media(scope="groups", owner_id="G1",
+                                  source=str(voice), file_type=3)) == "FI-big"
+    assert seen == {"scope": "groups", "owner_id": "G1", "size": 44,
+                    "file_name": "long.wav", "file_type": 3}
+
+
+def test_huge_local_file_is_capped_before_it_is_held_in_memory(tmp_path, monkeypatch):
+    # The cap used to be checked after read(), so an oversized path put the whole file
+    # in memory only to be refused.
+    calls = []
+
+    def capped_read(path, limit=0):
+        calls.append(limit)
+        return b"x" * (limit + 1)          # pretend the file is bigger than the cap
+
+    monkeypatch.setattr("utils.connection.qq.open_platform._read_bytes", capped_read)
+    conn = _conn()
+    assert run(conn._upload_media(scope="groups", owner_id="G1",
+                                  source="C:/big.wav", file_type=3)) == ""
+    assert calls and calls[0] > 0          # the read was told the ceiling
+
+
+def test_quoting_the_bots_own_message_is_recognised_on_receive():
+    conn = _conn()
+    conn.record_sent_message_id("SENT-1")
+    msg = conn._convert_event("GROUP_MESSAGE_CREATE", {
+        "id": "m-ref", "group_openid": "G1", "content": "确实好用",
+        "author": {"member_openid": "MA"},
+        "message_reference": {"message_id": "SENT-1"}})
+    assert msg["quoted_message_id"] == "SENT-1"
+    assert msg["is_reply_to_bot"] is True
+    other = conn._convert_event("GROUP_MESSAGE_CREATE", {
+        "id": "m-ref2", "group_openid": "G1", "content": "hi",
+        "author": {"member_openid": "MA"},
+        "message_reference": {"message_id": "SOMEBODY-ELSE"}})
+    assert other["is_reply_to_bot"] is False
