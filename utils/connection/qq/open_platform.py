@@ -136,6 +136,11 @@ _INBOUND_DEDUP_PRUNE_AT = 256
 _NOTICE_SINK_TIMEOUT_SECONDS = 10.0
 _NOTICE_SINK_MAX_TASKS = 32
 
+#: How long a cached whole-group mute rule stays believed. The platform sends no event
+#: when an admin lifts it, so a TTL is the only thing that lets the connector answer
+#: that group again without a restart.
+_SHUT_RULE_TTL_SECONDS = 300.0
+
 # ==========================================
 # R11 identity scope: resolved
 # (docs/design/speaker-trust-entity-semantics.md §2.15.4)
@@ -432,6 +437,8 @@ class QQOpenPlatformConnection(QQOpenPlatformMediaMixin, ConnectionBase):
         self._group_muted: dict[str, float] = {}
         #: group_id -> last observed ``global_rule`` of the mute settings.
         self._shut_global_rule: dict[str, dict] = {}
+        #: group_id -> the time that rule was read. See ``_SHUT_RULE_TTL_SECONDS``.
+        self._shut_global_rule_at: dict[str, float] = {}
 
     @property
     def needs_attention(self) -> bool:
@@ -849,6 +856,8 @@ class QQOpenPlatformConnection(QQOpenPlatformMediaMixin, ConnectionBase):
             self._mutable("_bot_openid_by_group", dict).pop(gid, None)
             self._mutable("_seen_groups", dict).pop(gid, None)
             self._mutable("_bot_member_role_by_group", dict).pop(gid, None)
+            self._mutable("_shut_global_rule", dict).pop(gid, None)
+            self._mutable("_shut_global_rule_at", dict).pop(gid, None)
 
     def _fan_out_notice(self, event_type: str, payload: dict) -> None:
         """Hand one notice to every sink without waiting on any of them.
@@ -1056,7 +1065,10 @@ class QQOpenPlatformConnection(QQOpenPlatformMediaMixin, ConnectionBase):
         """
         mid = str(msg.get("message_id") or "").strip()
         if self._is_duplicate_inbound(mid):
-            return "duplicate"
+            # "merged" only when the second frame actually said more than the queued
+            # copy does. Plain redelivery stays "duplicate", so the caller's log and
+            # the contract #3706 shipped keep their meaning.
+            return "merged" if self._merge_pending_duplicate(msg) else "duplicate"
         evicted_id = ""
         try:
             self._message_queue.put_nowait(msg)
@@ -1084,6 +1096,58 @@ class QQOpenPlatformConnection(QQOpenPlatformMediaMixin, ConnectionBase):
                 )
         self._remember_inbound(mid)
         return None
+
+    def _merge_pending_duplicate(self, msg: dict[str, Any]) -> bool:
+        """Fold a second delivery of one message into the copy that is still queued.
+
+        This is where an @ signal used to die. With the group privilege on, the same
+        mention can arrive as ``GROUP_MESSAGE_CREATE`` first and as
+        ``GROUP_AT_MESSAGE_CREATE`` second. Until this group's bot openid is known the
+        full-push copy reads ``is_at_bot=False``; the AT frame -- the one that says,
+        from the platform itself, that the bot was addressed -- then matched the dedup
+        rule and was dropped, so the bot saw a summon, queued it as chatter and never
+        answered.
+
+        Only a still-queued copy can be upgraded. One already handed to the caller is
+        gone: re-queuing it would produce the second reply this whole guard exists to
+        prevent, so that path stays a plain duplicate.
+        """
+        mid = str(msg.get("message_id") or "").strip()
+        if not mid:
+            return False
+        items = getattr(self._message_queue, "_queue", None)
+        if items is None:
+            return False
+        try:
+            snapshot = list(items)
+        except Exception:
+            return False
+        for queued in snapshot:
+            if not (isinstance(queued, dict)
+                    and str(queued.get("message_id") or "").strip() == mid):
+                continue
+            changed = False
+            if msg.get("is_at_bot") and not queued.get("is_at_bot"):
+                queued["is_at_bot"] = True
+                changed = True
+            for key in ("mentions_all", "quoted_message_id", "is_reply_to_bot"):
+                if msg.get(key) and not queued.get(key):
+                    queued[key] = msg[key]
+                    changed = True
+            ids = list(queued.get("mentioned_user_ids") or [])
+            for who in msg.get("mentioned_user_ids") or []:
+                if who not in ids:
+                    ids.append(who)
+                    changed = True
+            if not changed:
+                return False
+            queued["mentioned_user_ids"] = ids
+            if self.logger:
+                self.logger.info(
+                    f"[QQOpenPlatform] 重复投递补全点名信号 {mid!r}"
+                    f"（is_at_bot={queued.get('is_at_bot')}）")
+            return True
+        return False
 
     def _evict_inbound_for(self, incoming: dict[str, Any]) -> Optional[str]:
         """Free one queue slot for ``incoming``, protecting bot-addressed messages.
@@ -1207,6 +1271,14 @@ class QQOpenPlatformConnection(QQOpenPlatformMediaMixin, ConnectionBase):
         rule = self._mutable("_shut_global_rule", dict).get(gid) or {}
         mode = str(rule.get("mode") or "").strip().lower()
         if mode in ("always", "global", "all"):
+            # Fresh or stale? An admin lifting the whole-group mute sends no event, and
+            # nothing else expires this record, so without a TTL the connector skipped
+            # every reply to that group forever after one read.
+            stamp = float(self._mutable("_shut_global_rule_at", dict).get(gid, 0) or 0)
+            if time.time() - stamp > _SHUT_RULE_TTL_SECONDS:
+                self._mutable("_shut_global_rule", dict).pop(gid, None)
+                self._mutable("_shut_global_rule_at", dict).pop(gid, None)
+                return False
             return True
         return False
 
@@ -2024,11 +2096,21 @@ class QQOpenPlatformConnection(QQOpenPlatformMediaMixin, ConnectionBase):
                 "file_type": int(file_type), "url": source, "srv_send_msg": False}
         else:
             if source.startswith(_BASE64_PREFIX):
-                # The payload already sits in memory as a str, so there is nothing to
-                # protect here beyond the byte cap below. shortcut: the name comes from
-                # the image magic table; extend it per file_type when a caller appears.
-                decoded = await asyncio.to_thread(
-                    _decode_base64_source, source[len(_BASE64_PREFIX):])
+                encoded = source[len(_BASE64_PREFIX):]
+                predicted = len(encoded) * 3 // 4
+                if predicted > UPLOAD_HARD_MAX_BYTES:
+                    # Refuse on the encoded length, before decoding. Decoding first to
+                    # measure the result allocates the whole payload plus its
+                    # intermediate copies only to throw it away, and concurrent sends
+                    # turn that into memory pressure. shortcut: the file name comes
+                    # from the image magic table; extend it per file_type when a
+                    # caller appears.
+                    if self.logger:
+                        self.logger.warning(
+                            f"[QQOpenPlatform] base64 载荷约 {predicted} 字节，超过 "
+                            f"{UPLOAD_HARD_MAX_BYTES} 上限，未解码即拒绝")
+                    return ""
+                decoded = await asyncio.to_thread(_decode_base64_source, encoded)
                 raw, file_name = decoded.payload, decoded.file_name
             else:
                 path = _local_path(source)
@@ -2059,10 +2141,18 @@ class QQOpenPlatformConnection(QQOpenPlatformMediaMixin, ConnectionBase):
                 # about 10 MB, and refusing it was the whole reason the voice feature
                 # looked dead on a real recording.
                 try:
+                    await self._ensure_token()
                     return await self._media_upload_chunked(
                         scope=scope, owner_id=owner_id, payload=raw,
                         file_name=file_name, file_type=int(file_type))
-                except QQOpenPlatformAPIError as exc:
+                except Exception as exc:
+                    # Broad on purpose, and only for this branch. The chunked protocol
+                    # lives in the media mixin and posts through ``_media_post``, which
+                    # raises ``httpx.HTTPStatusError`` on a non-2xx answer instead of
+                    # the classified ``QQOpenPlatformAPIError`` this method otherwise
+                    # catches, and it never touched the token at all. Letting either
+                    # out would break the documented degrade: the caller expects
+                    # ``""`` / ``None`` and falls back to text.
                     if self.logger:
                         self.logger.warning(f"[QQOpenPlatform] 分片上传失败: {exc}")
                     return ""
@@ -2469,6 +2559,7 @@ class QQOpenPlatformConnection(QQOpenPlatformMediaMixin, ConnectionBase):
         gid = str(group_id or "").strip()
         data = await self._api("GET", f"/v2/groups/{gid}/restrict_chat_setting")
         rule = data.get("global_rule")
+        self._mutable("_shut_global_rule_at", dict)[gid] = time.time()
         self._mutable("_shut_global_rule", dict)[gid] = (
             rule if isinstance(rule, dict) else {})
         members = data.get("members")

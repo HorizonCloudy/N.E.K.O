@@ -280,6 +280,61 @@ def test_ordinary_chatter_yields_to_an_incoming_at():
     assert "chatter-1" not in queued       # the oldest chatter went first
 
 
+def test_full_message_first_does_not_swallow_the_later_at_signal():
+    # Greptile r4574476364: with the privilege on, GROUP_MESSAGE_CREATE can land
+    # first and read is_at_bot=False because this group's bot openid is not known
+    # yet. Dropping the AT frame as a plain duplicate then dropped the summon,
+    # and the bot never answered a direct @.
+    import asyncio
+
+    conn = QQOpenPlatformConnection.__new__(QQOpenPlatformConnection)
+    conn._self_id = ""
+    conn.logger = None
+    conn._message_queue = asyncio.Queue(maxsize=8)
+    payload = {
+        "id": "summon-1", "group_openid": "G9",
+        "content": "喂 <@EEEEEEEEEEEEEEEE>",
+        "author": {"member_openid": "MA"},
+    }
+    at_payload = dict(payload)
+    at_payload["mentions"] = [{"member_openid": "EEEEEEEEEEEEEEEE", "is_you": True}]
+
+    async def drive(event_type, body):
+        await conn._dispatch_event(event_type, body, "e1")
+        await asyncio.sleep(0)
+
+    asyncio.run(drive("GROUP_MESSAGE_CREATE", payload))
+    asyncio.run(drive("GROUP_AT_MESSAGE_CREATE", at_payload))
+
+    assert conn._message_queue.qsize() == 1          # still delivered once
+    queued = conn._message_queue.get_nowait()
+    assert queued["is_at_bot"] is True               # ... and the @ survived
+    assert "EEEEEEEEEEEEEEEE" in queued["mentioned_user_ids"]
+
+
+def test_at_frame_first_stays_correct_when_the_full_copy_arrives_after():
+    import asyncio
+
+    conn = QQOpenPlatformConnection.__new__(QQOpenPlatformConnection)
+    conn._self_id = ""
+    conn.logger = None
+    conn._message_queue = asyncio.Queue(maxsize=8)
+    payload = {
+        "id": "summon-2", "group_openid": "G9", "content": "喂 <@FFFFFFFFFFFFFFFF>",
+        "author": {"member_openid": "MA"},
+        "mentions": [{"member_openid": "FFFFFFFFFFFFFFFF", "is_you": True}],
+    }
+
+    async def drive(body):
+        await conn._dispatch_event("GROUP_AT_MESSAGE_CREATE", body, "e1")
+        await asyncio.sleep(0)
+
+    asyncio.run(drive(payload))
+    asyncio.run(drive(dict(payload, mentions=None)))
+    assert conn._message_queue.qsize() == 1
+    assert conn._message_queue.get_nowait()["is_at_bot"] is True
+
+
 def test_full_mode_and_at_event_for_one_message_deliver_once():
     # With the group privilege on, the platform can push both
     # GROUP_AT_MESSAGE_CREATE and GROUP_MESSAGE_CREATE for the same msg_id. Two

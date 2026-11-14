@@ -541,6 +541,110 @@ def test_stubs_are_gone_from_the_surface():
     assert not flagged, f"仍然静默回空值的方法: {flagged}"
 
 
+def test_whole_group_mute_expires_when_nobody_lifts_it_loudly():
+    # Greptile r4574476395: the platform sends no event when an admin lifts a
+    # whole-group mute, so a cached rule without an expiry silenced the group for
+    # the life of the process.
+    conn = _conn()
+    conn._shut_global_rule = {"G1": {"mode": "always"}}
+    conn._shut_global_rule_at = {"G1": __import__("time").time()}
+    assert conn.is_group_muted("G1") is True
+
+    conn._shut_global_rule_at = {"G1": __import__("time").time() - 301}
+    assert conn.is_group_muted("G1") is False
+    assert "G1" not in conn._shut_global_rule
+
+
+def test_shut_list_read_stamps_the_rule_age():
+    conn = _conn([_Response({"members": [], "global_rule": {"mode": "always"}})])
+    run(conn.get_group_shut_list("G1"))
+    assert conn.group_shut_global_rule("G1") == {"mode": "always"}
+    assert conn._shut_global_rule_at["G1"] > 0
+
+
+def test_being_removed_from_a_group_forgets_its_mute_rule():
+    conn = _conn()
+
+    async def go():
+        await conn._dispatch_event("GROUP_DEL_ROBOT", {"group_openid": "G1"}, "e1")
+
+    run(go())
+    assert "G1" not in conn._shut_global_rule
+    assert "G1" not in conn._shut_global_rule_at
+
+
+def test_oversized_base64_is_refused_before_it_is_decoded(monkeypatch):
+    # Greptile r4574476408: the decode allocated the whole payload just to be
+    # rejected by the size cap afterwards.
+    from utils.connection.qq import open_platform as op
+
+    calls = []
+    monkeypatch.setattr(op, "UPLOAD_HARD_MAX_BYTES", 1024)
+
+    def boom(*a, **kw):
+        calls.append(1)
+        raise AssertionError("decoded an oversized payload")
+
+    monkeypatch.setattr(op, "_decode_base64_source", boom)
+    conn = _conn()
+    huge = "A" * (2048 * 2)                      # ~1.5 KB decoded, cap is 1 KB
+    assert run(conn._upload_media(scope="groups", owner_id="G1",
+                                  source="base64://" + huge, file_type=3)) == ""
+    assert calls == []
+
+
+def test_chunked_upload_failure_degrades_instead_of_raising(monkeypatch):
+    # Greptile r4574476380: the chunked protocol posts through the media mixin,
+    # which raises httpx errors instead of the classified one, and it never
+    # checked the token. Either escaping here breaks the text fallback the
+    # caller relies on.
+    import httpx
+
+    async def explode(**kwargs):
+        raise httpx.ConnectError("upload service down")
+
+    conn = _conn()
+    monkeypatch.setattr(conn, "_media_upload_chunked", explode)
+    monkeypatch.setattr("utils.connection.qq.open_platform.INLINE_UPLOAD_MAX_BYTES", 4)
+    raw = b"x" * 64
+    assert run(conn._upload_media(scope="groups", owner_id="G1",
+                                  source="base64://" + __import__("base64").b64encode(raw).decode(),
+                                  file_type=3)) == ""
+
+
+def test_chunked_upload_checks_the_token_first(monkeypatch):
+    seen = []
+
+    async def fake_chunked(**kwargs):
+        seen.append("chunked")
+        return "FI"
+
+    async def explode():
+        raise QQOpenPlatformAPIError(method="POST", path="/token",
+                                     message="token unavailable")
+
+    conn = _conn()
+    raw = "base64://" + __import__("base64").b64encode(b"y" * 64).decode()
+    monkeypatch.setattr("utils.connection.qq.open_platform.INLINE_UPLOAD_MAX_BYTES", 4)
+    monkeypatch.setattr(conn, "_media_upload_chunked", fake_chunked)
+
+    async def dead_token():
+        raise QQOpenPlatformAPIError(method="POST", path="/token",
+                                     message="token unavailable")
+
+    monkeypatch.setattr(conn, "_ensure_token", dead_token)
+    assert run(conn._upload_media(scope="groups", owner_id="G1",
+                                  source=raw, file_type=3)) == ""
+    assert seen == []                            # a broken token never reaches upload
+
+    async def live_token():
+        return None
+
+    monkeypatch.setattr(conn, "_ensure_token", live_token)
+    assert run(conn._upload_media(scope="groups", owner_id="G1",
+                                  source=raw, file_type=3)) == "FI"
+    assert seen == ["chunked"]
+
 def test_missing_target_ids_are_refused_out_loud():
     # The guard used to be a bare ``return {}``: the caller saw a success-shaped value
     # and nothing in the log said why the operation did nothing.
@@ -584,9 +688,10 @@ def test_card_link_normalisation_covers_the_other_shapes():
 
 def test_whole_group_mute_is_reported_even_without_a_per_member_record():
     # The PR stores global_rule and the reviewer's point was that nothing read it.
-    conn = _conn()
+    # The rule is taken from a real shut-list read, which is also what stamps its age.
+    conn = _conn([_Response({"members": [], "global_rule": {"mode": "always"}})])
     assert conn.is_group_muted("G1") is False
-    conn._shut_global_rule = {"G1": {"mode": "always"}}
+    run(conn.get_group_shut_list("G1"))
     assert conn.is_group_muted("G1") is True
     assert conn.is_group_muted("G2") is False
 
