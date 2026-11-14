@@ -87,13 +87,38 @@ def test_capability_flags_follow_the_v2_surface():
 
 def test_needs_attention_follows_reception_rather_than_a_constant():
     conn = _conn()
-    conn._recv_msg_setting = "all"
+    conn._recv_msg_setting_by_group["G1"] = "all"
     assert conn.receives_all_messages is True
     assert conn.needs_attention is True
+    assert conn.group_receives_all_messages("G1") is True
+    # A second group that never said "all" must not inherit the first one's privilege.
+    assert conn.group_receives_all_messages("G2") is False
 
-    conn._recv_msg_setting = "only_mention"
-    conn._all_messages_observed = True
-    assert conn.receives_all_messages is True   # an actual push is proof by itself
+    conn2 = _conn()
+    conn2._all_messages_observed_groups.add("G1")   # an actual push is proof by itself
+    assert conn2.receives_all_messages is True
+    assert conn2.group_receives_all_messages("G1") is True
+    assert conn2.group_receives_all_messages("G9") is False
+
+
+def test_one_group_push_change_does_not_answer_for_every_group():
+    # The per-group facts used to live in connection-wide fields, so the last group
+    # asked decided the role and the setting for all of them.
+    conn = _conn([
+        _Response({"recv_msg_setting": "all", "member_role": "admin", "member_openid": "B1"}),
+        _Response({"recv_msg_setting": "only_mention", "member_role": "member", "member_openid": "B2"}),
+    ])
+    run(conn.get_group_bot_state("G1"))
+    run(conn.get_group_bot_state("G2"))
+    assert conn.group_recv_msg_setting("G1") == "all"
+    assert conn.group_recv_msg_setting("G2") == "only_mention"
+    assert conn.group_bot_member_role("G1") == "admin"
+    assert conn.group_bot_member_role("G2") == "member"
+    assert conn._bot_openid_by_group == {"G1": "B1", "G2": "B2"}
+    # Both connection-wide properties refuse to answer once two groups disagree:
+    # picking one entry would make the result depend on which group spoke first.
+    assert conn.bot_member_role == ""
+    assert conn.recv_msg_setting == ""
 
 
 def test_group_list_reports_observed_groups_instead_of_a_flat_empty():
@@ -306,7 +331,10 @@ def test_bot_state_lands_the_member_openid():
     conn = _conn([_Response({"recv_msg_setting": "all", "member_role": "member",
                              "member_openid": "BOT1"})])
     run(conn.get_group_bot_state("G1"))
-    assert conn._bot_member_openid == "BOT1"
+    # The id is keyed by group: the platform issues a different one per conversation.
+    assert conn._bot_openid_by_group == {"G1": "BOT1"}
+    assert conn._remembered_bot_openid("G1") == "BOT1"
+    assert conn._remembered_bot_openid("G2") == ""
 
 
 def test_shut_list_keeps_the_global_rule():

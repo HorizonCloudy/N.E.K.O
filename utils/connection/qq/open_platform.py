@@ -7,6 +7,7 @@ import base64
 import json
 import os
 import time
+from collections import deque
 from typing import Any, Optional
 
 import re as _re
@@ -113,6 +114,14 @@ _IMAGE_PLACEHOLDER = "[图片]"
 #: and rejects the reply as a duplicate; past the window no reply to that id is accepted
 #: at all, so restarting is harmless.
 _MSG_SEQ_TTL_SECONDS = 2 * 60 * 60
+
+#: How long an inbound ``message_id`` is remembered, for duplicate suppression. Short on
+#: purpose: it only has to span the gap between two deliveries of the *same* event, which
+#: arrive back to back. A long window would risk dropping a legitimately distinct message
+#: that happened to reuse an id.
+_INBOUND_DEDUP_TTL_SECONDS = 60.0
+#: Prune the dedup table only once it grows past this, so the common path stays O(1).
+_INBOUND_DEDUP_PRUNE_AT = 256
 
 # ==========================================
 # R11 identity scope: resolved
@@ -280,10 +289,10 @@ class QQOpenPlatformConnection(QQOpenPlatformMediaMixin, ConnectionBase):
     #: ``__new__`` (test harnesses, partial reconstruction), and a missing attribute
     #: there raises inside event handling -- which the receive loop reports as a
     #: disconnect, so it would look like an unstable connection rather than a bug.
-    _all_messages_observed = False
-    _recv_msg_setting = ""
-    _bot_member_role = ""
-    _bot_member_openid = ""
+    #: The per-group facts live in dicts created on first use (``_mutable``), so no
+    #: mutable default is ever shared between instances: the bot's group-side openid,
+    #: its role and the push setting are all issued **per conversation**, and a single
+    #: attribute let one group's value decide another group's @-attribution.
 
     #: Production and sandbox are **two different domains**. An unpublished bot only
     #: exists in the sandbox: connecting to the production gateway completes the
@@ -386,10 +395,16 @@ class QQOpenPlatformConnection(QQOpenPlatformMediaMixin, ConnectionBase):
         #: least recently used first (see ``_next_msg_seq``).
         self._msg_seq_by_reply_id: dict[str, tuple[int, float]] = {}
         #: Proof that the platform is pushing every group message (see the property).
-        self._all_messages_observed = False
-        self._recv_msg_setting = ""
-        self._bot_member_openid = ""
-        self._bot_member_role = ""
+        #: Per group: the privilege is granted conversation by conversation, so one
+        #: connection-wide boolean would let a single full-push group advertise every
+        #: other group as full-push too.
+        self._all_messages_observed_groups: set[str] = set()
+        self._recv_msg_setting_by_group: dict[str, str] = {}
+        self._bot_openid_by_group: dict[str, str] = {}
+        self._bot_member_role_by_group: dict[str, str] = {}
+        #: Inbound ids accepted recently -> the monotonic time they arrived. Guards
+        #: against the platform delivering one message twice (see ``_enqueue_inbound``).
+        self._seen_inbound_ids: dict[str, float] = {}
         #: Groups this connection actually saw a message from; the platform offers no
         #: "my groups" listing, so observed ids are the only honest answer.
         self._seen_groups: dict[str, float] = {}
@@ -408,6 +423,11 @@ class QQOpenPlatformConnection(QQOpenPlatformMediaMixin, ConnectionBase):
         group is in mention-only mode. Once the platform pushes
         ``GROUP_MESSAGE_CREATE`` the consumer does have to decide who a message was
         for, so the flag follows :attr:`receives_all_messages` instead of a constant.
+
+        Connection-wide by contract: it answers "is any conversation here delivering
+        unaddressed traffic", which is what an attention consumer branches on before
+        it has a message. For one group ask
+        :meth:`group_receives_all_messages` instead.
         """
         return self.receives_all_messages
 
@@ -421,16 +441,45 @@ class QQOpenPlatformConnection(QQOpenPlatformMediaMixin, ConnectionBase):
 
     @property
     def receives_all_messages(self) -> bool:
-        """True once the platform is actually pushing every group message.
+        """True while any group is known to push every group message.
 
         Two independent proofs, either is enough: ``bot_state.recv_msg_setting``
         says ``all`` (that interface is permission-gated, so it is often unavailable),
         or a ``GROUP_MESSAGE_CREATE`` really arrived. Guessing from settings alone
         would claim a capability the platform may not have enabled for the group.
+
+        Aggregated on purpose, and aggregated pessimistically: the privilege belongs
+        to one group, so a second group that only pushes @mentions must not be
+        reported as full-push by the first one's traffic. Use
+        :meth:`group_receives_all_messages` wherever a group id is at hand -- which
+        is everywhere a reply decision is made.
         """
-        if self._recv_msg_setting == "all":
+        if self._mutable("_all_messages_observed_groups", set):
             return True
-        return self._all_messages_observed
+        return "all" in self._mutable("_recv_msg_setting_by_group", dict).values()
+
+    def group_receives_all_messages(self, group_id: str) -> bool:
+        """Whether one specific group pushes every message (not just @mentions)."""
+        gid = str(group_id or "").strip()
+        if not gid:
+            return False
+        if gid in self._mutable("_all_messages_observed_groups", set):
+            return True
+        return self.group_recv_msg_setting(gid) == "all"
+
+    def group_recv_msg_setting(self, group_id: str) -> str:
+        """``all`` / ``only_mention`` / ``mention_and_context`` / ``""`` for one group."""
+        gid = str(group_id or "").strip()
+        if not gid:
+            return ""
+        return str(self._mutable("_recv_msg_setting_by_group", dict).get(gid, "") or "")
+
+    def group_bot_member_role(self, group_id: str) -> str:
+        """``member`` / ``admin`` / ``owner`` for one group, or ``""`` when unknown."""
+        gid = str(group_id or "").strip()
+        if not gid:
+            return ""
+        return str(self._mutable("_bot_member_role_by_group", dict).get(gid, "") or "")
 
     @property
     def supports_ark_cards(self) -> bool:
@@ -453,13 +502,34 @@ class QQOpenPlatformConnection(QQOpenPlatformMediaMixin, ConnectionBase):
 
     @property
     def recv_msg_setting(self) -> str:
-        """``all`` / ``only_mention`` / ``mention_and_context`` / ``""`` (not probed)."""
-        return self._recv_msg_setting
+        """The push setting, when exactly one group is known (else ``""``).
+
+        The real answer is per group, so a single connection-wide string would be a
+        guess. Use :meth:`group_recv_msg_setting` wherever a group id exists; this
+        property only survives for callers that provably serve one group, and it
+        refuses to answer rather than mix conversations.
+        """
+        return self._sole_group_value("_recv_msg_setting_by_group")
 
     @property
     def bot_member_role(self) -> str:
-        """``member`` / ``admin`` / ``owner`` as reported by ``bot_state``, or ``""``."""
-        return self._bot_member_role
+        """The bot's role, when exactly one group is known (else ``""``).
+
+        Same reasoning as :attr:`recv_msg_setting`: ``member`` in one group and
+        ``admin`` in another has no connection-wide answer worth reporting.
+        """
+        return self._sole_group_value("_bot_member_role_by_group")
+
+    def _sole_group_value(self, container: str) -> str:
+        """One value out of a per-group map, but only when the map holds exactly one.
+
+        Returning the first entry would be the bug this avoids: dict order is an
+        accident of which group spoke first.
+        """
+        values = list(self._mutable(container, dict).values())
+        if len(values) != 1:
+            return ""
+        return str(values[0] or "")
 
     async def get_login_info(self) -> dict[str, Any]:
         return {"user_id": self._self_id, "nickname": self._self_nickname}
@@ -524,7 +594,13 @@ class QQOpenPlatformConnection(QQOpenPlatformMediaMixin, ConnectionBase):
             except asyncio.TimeoutError:
                 if self.logger:
                     self.logger.warning("[QQOpenPlatform] Resume 超时，回退 Identify")
-        # Identify
+        # Identify -- this establishes a NEW session: either the very first one, or the
+        # fallback after Resume was rejected or timed out. Either way the full-push
+        # proof must be re-learned rather than inherited, because a group can switch
+        # back to "@-only" while the connection is down. A successful Resume returns
+        # above and keeps the known-good value, which is why the reset belongs here and
+        # not in the reconnect path.
+        self._mutable("_all_messages_observed_groups", set).clear()
         await self._ws.send(json.dumps({
             "op": 2, "d": {
                 "token": f"QQBot {self._access_token}",
@@ -681,26 +757,25 @@ class QQOpenPlatformConnection(QQOpenPlatformMediaMixin, ConnectionBase):
         if not isinstance(data, dict):
             return
         if event_type in MESSAGE_EVENTS:
-            if event_type == "GROUP_MESSAGE_CREATE" and not self._all_messages_observed:
-                self._all_messages_observed = True
-                if self.logger:
-                    self.logger.info(
-                        "[QQOpenPlatform] 收到 GROUP_MESSAGE_CREATE：本通道正在推送全量群消息"
-                    )
+            if event_type == "GROUP_MESSAGE_CREATE":
+                # The privilege is per group and invisible in the intents bitmap, so a
+                # real push is the only proof. Recorded here rather than in
+                # _convert_event so a payload that fails to convert still proves it.
+                self._note_full_group_message(data)
             msg = self._convert_event(event_type, data)
             if not msg:
                 return
             self._remember_group(msg.get("group_id") or "")
-            try:
-                self._message_queue.put_nowait(msg)
-            except asyncio.QueueFull:
-                # Keep the newest context: dropping the incoming message would leave the
-                # conversation with a hole exactly where a reply is being decided.
-                try:
-                    self._message_queue.get_nowait()
-                except Exception:
-                    pass
-                self._message_queue.put_nowait(msg)
+            refusal = self._enqueue_inbound(msg)
+            if refusal == "duplicate" and self.logger:
+                # Same message already queued from another event type: routine, but it
+                # is what a double reply would have started with.
+                self.logger.info(
+                    f"[QQOpenPlatform] 丢弃重复投递的消息 {msg.get('message_id')!r} "
+                    f"(event={event_type})"
+                )
+            # The capacity refusal is logged inside _enqueue_inbound, where the
+            # eviction decision is known.
             return
         if event_type not in NOTICE_EVENTS:
             # Loud enough to notice in a log, quiet enough not to look like a failure:
@@ -778,6 +853,229 @@ class QQOpenPlatformConnection(QQOpenPlatformMediaMixin, ConnectionBase):
             seen.pop(stale, None)
         seen[group_id] = now
 
+    def _is_pending_inbound(self, message_id: str) -> bool:
+        """True when a message with this id is still sitting in the queue.
+
+        Scanning beats keeping a parallel pending-set: the queue is bounded
+        (``message_queue_size``, 100 by default) and this only runs for an id that is
+        already being re-delivered. A second structure would also have to be kept in
+        sync by every eviction path, and a missed sync there is exactly the silent
+        double-delivery this guard exists to prevent.
+        """
+        mid = str(message_id or "").strip()
+        if not mid:
+            return False
+        queue = getattr(self, "_message_queue", None)
+        items = getattr(queue, "_queue", None)
+        if items is None:
+            return False
+        try:
+            for queued in list(items):
+                if (
+                    isinstance(queued, dict)
+                    and str(queued.get("message_id") or "").strip() == mid
+                ):
+                    return True
+        except Exception:
+            # Unknown internals must never turn a duplicate check into a crash.
+            return False
+        return False
+
+    def _is_duplicate_inbound(self, message_id: str) -> bool:
+        """True when this inbound message id was already accepted.
+
+        Two horizons, because they answer different questions:
+
+        - **still queued** -> a duplicate, no matter how long it has waited. The TTL
+          must not apply here: a slow consumer could otherwise leave a message pending
+          past the window, and a redelivery would queue the same id twice and deliver
+          it twice.
+        - **already delivered** -> a duplicate only within the short TTL, so a reused
+          id is not suppressed forever.
+
+        Query only. Recording is a separate step (:meth:`_remember_inbound`) performed
+        *after* the message really lands in the queue. Recording here would be a trap:
+        a message that arrives, gets recorded, and is then evicted to make room would be
+        suppressed on redelivery while no longer pending anywhere -- lost for good.
+        """
+        mid = str(message_id or "").strip()
+        if not mid:
+            return False
+        if self._is_pending_inbound(mid):
+            return True
+        seen = self._mutable("_seen_inbound_ids", dict)
+        previous = seen.get(mid)
+        if previous is None:
+            return False
+        return (time.monotonic() - previous) < _INBOUND_DEDUP_TTL_SECONDS
+
+    def _remember_inbound(self, message_id: Any) -> None:
+        """Record that this id is now pending, or already handed to the caller."""
+        mid = str(message_id or "").strip()
+        if not mid:
+            return
+        seen = self._mutable("_seen_inbound_ids", dict)
+        now = time.monotonic()
+        if len(seen) > _INBOUND_DEDUP_PRUNE_AT:
+            cutoff = now - _INBOUND_DEDUP_TTL_SECONDS
+            for stale in [key for key, stamp in seen.items() if stamp < cutoff]:
+                seen.pop(stale, None)
+        seen[mid] = now
+
+    def _forget_inbound(self, message_id: Any) -> None:
+        """Drop the dedup record when the message is no longer pending anywhere."""
+        mid = str(message_id or "").strip()
+        if not mid:
+            return
+        self._mutable("_seen_inbound_ids", dict).pop(mid, None)
+
+    def _enqueue_inbound(self, msg: dict[str, Any]) -> Optional[str]:
+        """Queue one converted message, keeping the dedup table consistent.
+
+        Returns ``None`` when the message is queued, otherwise the refusal reason:
+
+        - ``"duplicate"`` -- the same id was accepted moments ago;
+        - ``"queue_full"`` -- the queue holds only bot-addressed messages and this one
+          is not addressed, so it is refused rather than sacrificing a summon.
+
+        They are returned separately because the caller reports them differently: a
+        duplicate is routine (the platform documents redelivery), while refusing for
+        capacity says the consumer is falling behind.
+
+        Ordering matters: the id is recorded only once the message is safely queued, and
+        an *evicted* message's record is removed again. Both halves exist so a message
+        can never end up "not pending, yet considered already seen".
+        """
+        mid = str(msg.get("message_id") or "").strip()
+        if self._is_duplicate_inbound(mid):
+            return "duplicate"
+        evicted_id = ""
+        try:
+            self._message_queue.put_nowait(msg)
+        except asyncio.QueueFull:
+            evicted_id = self._evict_inbound_for(msg)
+            if evicted_id is None:
+                # Everything queued is addressed to the bot and this arrival is not:
+                # keep the summons, drop the chatter.
+                if self.logger:
+                    self.logger.warning(
+                        f"[QQOpenPlatform] 队列已满且全是点名消息，丢弃普通消息 {mid or '(未知)'}"
+                    )
+                return "queue_full"
+            self._message_queue.put_nowait(msg)
+            if evicted_id:
+                # The evicted message is no longer pending, so it must not stay
+                # remembered: a redelivery of it is the only remaining chance to have
+                # it processed.
+                self._forget_inbound(evicted_id)
+            if self.logger:
+                kept = "点名消息" if msg.get("is_at_bot") else "消息"
+                self.logger.warning(
+                    f"[QQOpenPlatform] 消息队列已满，丢弃 {evicted_id or '(未知)'} "
+                    f"以容纳{kept} {mid or '(未知)'}"
+                )
+        self._remember_inbound(mid)
+        return None
+
+    def _evict_inbound_for(self, incoming: dict[str, Any]) -> Optional[str]:
+        """Free one queue slot for ``incoming``, protecting bot-addressed messages.
+
+        Under full-message mode the queue fills with ordinary group chatter, and a blind
+        drop-oldest discards whichever message happens to be oldest -- quite possibly the
+        one @bot a human is waiting on. Priority, highest first:
+
+        1. an already-queued *unaddressed* message goes, regardless of what arrives (the
+           @s already queued are as precious as the new one);
+        2. if every queued message is addressed to the bot:
+           - the arrival is addressed too -> evict the oldest @ (someone has to go);
+           - the arrival is chatter -> evict nothing, and the caller must reject it.
+             Trading a queued @ for new chatter is exactly backwards.
+
+        Returns the evicted message id ("" when unknown), or ``None`` when nothing could
+        be evicted -- in which case the caller drops ``incoming``.
+
+        Reaches into ``asyncio.Queue._queue`` because the public API cannot remove an
+        arbitrary element; ``get_nowait()`` only ever yields the oldest. Both paths leave
+        ``_unfinished_tasks`` untouched, so they stay equivalent on that front.
+        """
+        queue = self._message_queue
+        items = getattr(queue, "_queue", None)
+        if not isinstance(items, deque) or not items:
+            # Unrecognised internals (or an empty queue that reported full): fall back
+            # to the documented drop-oldest behaviour rather than raising.
+            try:
+                queue.get_nowait()
+            except asyncio.QueueEmpty:
+                pass
+            return ""
+        for index, queued in enumerate(items):
+            if isinstance(queued, dict) and not queued.get("is_at_bot"):
+                victim = items[index]
+                del items[index]
+                return str(victim.get("message_id") or "")
+        if not (isinstance(incoming, dict) and incoming.get("is_at_bot")):
+            return None
+        victim = items[0]
+        del items[0]
+        return str(victim.get("message_id") or "") if isinstance(victim, dict) else ""
+
+    def _learn_bot_openid(self, group_id: str, openid: str) -> None:
+        """Cache the bot's own group-side openid for one group.
+
+        Openids are issued per conversation, so a single field would let one group's
+        value misclassify another group's @bot as "mentioning someone else". READY only
+        carries the app-level id, which never matches a group openid.
+        """
+        gid = str(group_id or "").strip()
+        if not gid:
+            return
+        self._mutable("_bot_openid_by_group", dict)[gid] = str(openid or "")
+
+    def _remembered_bot_openid(self, group_id: str) -> str:
+        """The bot's openid previously learned for ``group_id`` ("" when unknown)."""
+        gid = str(group_id or "").strip()
+        if not gid:
+            return ""
+        return str(self._mutable("_bot_openid_by_group", dict).get(gid, "") or "")
+
+    def _warn_unknown_bot_openid(self, group_id: str, event_type: str) -> None:
+        """Report once per group that an @ target could not be attributed to the bot.
+
+        Before the platform has ever flagged this bot with ``is_you``, an inline-only
+        mention has no trustworthy owner. Rather than guess (a wrong guess either
+        swallows the real @ or makes the bot answer messages aimed at someone else), the
+        conversion reports ``False`` and this makes the situation observable.
+        """
+        warned = self._mutable("_openid_unattributed_warned", set)
+        key = str(group_id or "").strip()
+        if key in warned:
+            return
+        warned.add(key)
+        message = (
+            f"[QQOpenPlatform] 群 {key or '(未知)'} 的 @ 无法归因到本机器人："
+            f"该群尚未收到过带 is_you 的提及（event={event_type}）。"
+            "在平台重新下发 is_you 之前，只带内联 <@OPENID> 的消息会被判定为未 @ 本机器人。"
+        )
+        if self.logger:
+            self.logger.warning(message)
+        # ``_emit_log`` is an instance attribute installed by ``__init__``, so objects
+        # built through ``__new__`` (the harnesses here) do not have it.
+        emit = getattr(self, "_emit_log", None)
+        if callable(emit):
+            emit("WARNING", message)
+
+    def _note_full_group_message(self, data: dict) -> None:
+        """Record that one group really pushed a non-mention message."""
+        gid = str(data.get("group_id") or data.get("group_openid") or "").strip()
+        seen = self._mutable("_all_messages_observed_groups", set)
+        if gid in seen:
+            return
+        seen.add(gid)
+        if self.logger:
+            self.logger.info(
+                f"[QQOpenPlatform] 收到 GROUP_MESSAGE_CREATE：群 {gid or '(未知)'} 正在推送全量群消息"
+            )
+
     def is_group_muted(self, group_id: str) -> bool:
         """Local mute bookkeeping, same shape as ``OneBotClient.is_group_muted``.
 
@@ -797,13 +1095,38 @@ class QQOpenPlatformConnection(QQOpenPlatformMediaMixin, ConnectionBase):
         return False
 
     async def receive_message(self, timeout: float = 1.0) -> Optional[dict[str, Any]]:
+        # Dequeue and stamp the dedup record in one uninterrupted step. Two failure
+        # modes motivate this, and each is covered by a different half:
+        #
+        # 1. **Which asyncio helper is used.** On 3.11 ``asyncio.wait_for`` runs the
+        #    awaitable in its *own* Task and hands the result back through a
+        #    done-callback, so the message is already dequeued while this coroutine is
+        #    still waiting to resume. The receive loop can run inside that gap and find
+        #    the id neither queued (the pending scan misses) nor within its TTL (it was
+        #    stamped at enqueue time), accept the redelivery, and the caller ends up
+        #    with the same message twice. ``asyncio.timeout`` cancels the *current*
+        #    task instead, so there is no such gap.
+        # 2. **Someone reintroducing an await in between.** Keeping the pair inside
+        #    ``_take_and_stamp`` makes "dequeued implies recorded" structural rather
+        #    than a convention about call sites.
+        async def _take_and_stamp() -> Any:
+            taken = await self._message_queue.get()
+            if isinstance(taken, dict):
+                # Restart the dedup clock at hand-off. The record was written when the
+                # message was *enqueued*, so one that waited longer than the TTL would
+                # fall out of its window the instant it is delivered -- and a
+                # redelivery right after would be accepted, handing it over twice.
+                self._remember_inbound(taken.get("message_id"))
+            return taken
+
         try:
-            message = await asyncio.wait_for(self._message_queue.get(), timeout=timeout)  # noqa: ASYNC_BLOCK -- _message_queue is an asyncio.Queue; .get() is awaitable and does not block the event loop
+            async with asyncio.timeout(timeout):
+                message = await _take_and_stamp()
         except asyncio.TimeoutError:
             return None
-        # Inbound broadcast hook (optional): hand the normalized message to the
-        # registered sink. Best-effort.
         if isinstance(message, dict):
+            # Inbound broadcast hook (optional): hand the normalized message to the
+            # registered sink. Best-effort.
             await self._dispatch_inbound(message)
         return message
 
@@ -1358,43 +1681,112 @@ class QQOpenPlatformConnection(QQOpenPlatformMediaMixin, ConnectionBase):
             # zero behavior change and guards against total message loss.
             group_id = str(data.get("group_id") or data.get("group_openid") or "")
             mentioned_ids: list[str] = []
+            #: @ targets found in the body, and those the ``mentions`` array explains.
+            #: Kept apart so the unattributed-@ diagnostic fires only for targets the
+            #: platform left unaccounted for.
+            inline_ids: list[str] = []
+            structured_ids: list[str] = []
+            mentions_all = False
+            #: Whether the payload itself says the bot was mentioned. This is the
+            #: authoritative signal: the platform marks each mention with
+            #: ``is_you: true`` for the receiving bot.
+            #:
+            #: Do **not** compare ``self_id`` against mention ids: ``self_id`` is the
+            #: app-level id while mentions carry per-group **openids**, and they never
+            #: match. That mismatch is exactly why @bot was dropped under full mode.
+            at_bot_by_payload = False
             # Two mention shapes exist in the wild: the documented v2 form
             # ``<@member_openid>`` (hex) and the legacy ``<@!uin>`` that older payloads
-            # and the OneBot side still produce. Parsing only the legacy one meant every
-            # v2 mention was invisible -- including mentions of the bot itself.
-            v2_tags = _AT_OPENID_RE.findall(content)
-            legacy_tags = _AT_LEGACY_RE.findall(content)
-            for user in data.get("mentions") or []:
-                if isinstance(user, dict):
-                    who = str(user.get("member_openid") or user.get("id") or "").strip()
-                    if who and who not in mentioned_ids:
-                        mentioned_ids.append(who)
-            for who in v2_tags + legacy_tags:
+            # and the OneBot side still produce.
+            #
+            # Deduplicated: a user can @ the same account twice, and counting
+            # *occurrences* instead of *distinct targets* would make "summoned only me,
+            # twice" look like "named me and someone else".
+            for who in _AT_OPENID_RE.findall(content) + _AT_LEGACY_RE.findall(content):
+                if who not in inline_ids:
+                    inline_ids.append(who)
                 if who not in mentioned_ids:
                     mentioned_ids.append(who)
-            mentions_all = "<@all>" in content
+            for item in data.get("mentions") or []:
+                if isinstance(item, dict):
+                    # ``member_openid`` first, matching ``_GROUP_ACTOR_ID_KEYS`` and the
+                    # inline markers: the body's ``<@OPENID>`` carries the *member*
+                    # openid, so that is the value the learned cache must hold. Reading
+                    # ``id`` first would cache a different field and make later
+                    # inline-only payloads miss the learned openid.
+                    who = str(
+                        item.get("member_openid") or item.get("openid") or item.get("id") or ""
+                    ).strip()
+                    if who:
+                        if who not in structured_ids:
+                            structured_ids.append(who)
+                        if who not in mentioned_ids:
+                            mentioned_ids.append(who)
+                    # Only ``is_you`` means "this mention is the receiving bot".
+                    # ``bot`` merely says the *target* is some bot: in a group with
+                    # several bots, @-ing a neighbour carries ``bot: true`` and no
+                    # ``is_you`` -- treating that as self would make this bot answer
+                    # messages addressed to it.
+                    if item.get("is_you") is True:
+                        at_bot_by_payload = True
+                        if who:
+                            # Cache per group: openids are issued per conversation.
+                            self._learn_bot_openid(group_id, who)
+                elif isinstance(item, str) and item.strip():
+                    if item.strip() not in mentioned_ids:
+                        mentioned_ids.append(item.strip())
             clean_content = _AT_OPENID_RE.sub("", _AT_LEGACY_RE.sub("", content))
             clean_content = clean_content.replace("<@all>", "").strip()
-            # The bot's own group-side identity is member_openid, which only bot_state
-            # (permission-gated) or a learned mention can supply; READY's id is app-level.
-            self_ids = {str(self._self_id or "")}
-            if self._bot_member_openid:
-                self_ids.add(self._bot_member_openid)
+            mentions_all = "<@all>" in content
+            bot_openid = self._remembered_bot_openid(group_id)
+            # Which @ targets are the bot itself? ``self_id`` is the app-level id and
+            # only matches legacy payloads; ``bot_openid`` is the per-group openid the
+            # current protocol actually emits.
+            bot_ids = {str(self._self_id or ""), str(bot_openid or "")}
+            bot_ids.discard("")
+            if bot_ids & set(mentioned_ids):
+                # The bot can be named in this list -- judge precisely.
+                mentions_other_user = any(mid not in bot_ids for mid in mentioned_ids)
+            elif event_type == "GROUP_AT_MESSAGE_CREATE":
+                # The platform only sends this event when the bot is mentioned, so the
+                # bot is in the list even while its own id is still unknown; more than
+                # one mention therefore means someone else was named too.
+                mentions_other_user = len(mentioned_ids) > 1
+            else:
+                # Full-message event with no known bot openid: any @ target could be
+                # someone else. Erring towards True keeps the bot from butting into
+                # conversations aimed at other people.
+                mentions_other_user = bool(mentioned_ids)
+
+            # is_at_bot resolution order (first hit wins):
+            #   1. GROUP_AT_MESSAGE_CREATE -- the platform only sends it when @bot;
+            #   2. the payload's own ``is_you`` mention flag;
+            #   3. a mention id matching this group's learned bot openid (payloads that
+            #      carry inline ``<@OPENID>`` markers and no mentions array).
+            #
+            # Step 3 needs an openid learned earlier from step 2, so it cannot fire on
+            # the very first inline-only payload of a group. That is acceptable while
+            # the platform keeps sending ``is_you``, but it would degrade silently if
+            # it ever stopped -- hence the diagnostic below.
             if event_type == "GROUP_AT_MESSAGE_CREATE":
-                # The platform only emits this event when the bot itself was addressed.
+                is_at_bot = True
+            elif at_bot_by_payload:
                 is_at_bot = True
             else:
-                is_at_bot = bool(self_ids & set(mentioned_ids)) or any(
-                    f"<@{sid}>" in content for sid in self_ids if sid)
-                if is_at_bot and len(mentioned_ids) == 1:
-                    # The single mention was the bot: learn its group-side id so later
-                    # full-mode pushes can recognise it too. bot_state may never come.
-                    self._bot_member_openid = mentioned_ids[0]
-            if self._self_id:
-                mentions_other_user = any(mid not in self_ids for mid in mentioned_ids)
-            else:
-                # Without a known self id, only several mentions prove someone else was named.
-                mentions_other_user = len(mentioned_ids) > 1
+                is_at_bot = bool(bot_openid and bot_openid in mentioned_ids) or any(
+                    f"<@{sid}>" in content or f"<@!{sid}>" in content
+                    for sid in bot_ids
+                )
+                if not bot_openid:
+                    # Only warn about @ targets the platform did NOT account for. If
+                    # ``mentions`` already describes every inline marker, the payload is
+                    # complete and the absence of ``is_you`` simply means the bot was
+                    # not summoned -- @-ing someone else must not consume this group's
+                    # one-shot diagnostic, or a later genuinely unattributable @bot
+                    # would go unreported.
+                    unexplained = [mid for mid in inline_ids if mid not in structured_ids]
+                    if unexplained:
+                        self._warn_unknown_bot_openid(group_id, event_type)
 
             return {
                 "message_type": "group",
@@ -1830,12 +2222,16 @@ class QQOpenPlatformConnection(QQOpenPlatformMediaMixin, ConnectionBase):
         if not gid:
             return {}
         state = await self._api("GET", f"/v2/groups/{gid}/bot_state")
-        self._recv_msg_setting = str(state.get("recv_msg_setting") or "")
-        self._bot_member_role = str(state.get("member_role") or "")
-        # Keep an earlier self-detected id when this interface is not entitled
-        # to answer with one.
-        self._bot_member_openid = str(
-            state.get("member_openid") or self._bot_member_openid)
+        # Per group: the reception setting, the role and the group-side openid are all
+        # conversation facts. Storing them connection-wide let one group's admin role
+        # or openid decide another group's judgement.
+        self._mutable("_recv_msg_setting_by_group", dict)[gid] = str(state.get("recv_msg_setting") or "")
+        self._mutable("_bot_member_role_by_group", dict)[gid] = str(state.get("member_role") or "")
+        # Keep an earlier self-detected id when this interface is not entitled to
+        # answer with one.
+        learned = str(state.get("member_openid") or "").strip()
+        if learned:
+            self._learn_bot_openid(gid, learned)
         return state
 
     async def get_group_member_info(self, group_id: str = "", user_id: str = "", **_: Any) -> dict:
