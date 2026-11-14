@@ -421,3 +421,27 @@ def test_quoted_reply_is_not_evicted_as_chatter():
     assert "r1" in queued
     assert "c1" not in queued
     assert "c2" in queued
+
+def test_coroutine_sink_is_not_called_before_its_task_runs():
+    # Calling the sink first and wrapping the coroutine afterwards left an un-awaited
+    # coroutine object behind whenever disconnect() cancelled the task before its first
+    # step: a "coroutine ... was never awaited" warning on every shutdown under
+    # traffic, and the notice gone without a log. The guard is that dispatch returns
+    # with the sink NOT yet called and exactly one task owning the call. Whether the
+    # task then runs is covered by the timeout, bound and hanging-sink cases above.
+    conn = _conn()
+    called = []
+
+    async def sink(event_type, payload):
+        called.append(event_type)
+
+    conn.add_event_sink(sink)
+
+    async def go():
+        await conn._dispatch_event("FRIEND_ADD", {"user_openid": "U1"}, "e1")
+        return list(called), len(conn._sink_tasks)
+
+    called_after_dispatch, tasks = run(go())
+    assert called_after_dispatch == []
+    assert tasks == 1
+

@@ -473,9 +473,11 @@ def test_ark_card_request_is_translated_into_a_card_payload():
     card = body["card"]
     assert card["type"] == "tuwen"
     assert card["content"]["title"] == "状态" and card["content"]["description"] == "一切正常"
-    # https only: the platform drops non-https links rather than rendering them
-    assert card["content"]["url"].startswith("https://")
-    assert card["content"]["pic_url"].startswith("https://")
+    # https only: the platform drops non-https links rather than rendering them.
+    # Whole values, not prefixes: asserting startswith("https://") is what let
+    # "https://http://a.example/x" through this test for a whole review round.
+    assert card["content"]["url"] == "https://a.example/x"
+    assert card["content"]["pic_url"] == "https://i/y"
 
 
 # ── unsupported operations ─────────────────────────────────────────────────
@@ -722,9 +724,9 @@ def test_oversized_local_voice_goes_through_the_chunked_protocol(tmp_path, monke
     # Refusing it was the reason voice looked dead on any real recording.
     seen = {}
 
-    async def fake_chunked(*, scope, owner_id, payload, file_name, file_type):
+    async def fake_chunked(*, scope, owner_id, payload, file_name, file_type, digests=None):
         seen.update(scope=scope, owner_id=owner_id, size=len(payload),
-                    file_name=file_name, file_type=file_type)
+                    file_name=file_name, file_type=file_type, digests=digests)
         return "FI-big"
 
     conn = _conn()
@@ -734,8 +736,10 @@ def test_oversized_local_voice_goes_through_the_chunked_protocol(tmp_path, monke
     voice.write_bytes(b"RIFF" + b"0" * 40)
     assert run(conn._upload_media(scope="groups", owner_id="G1",
                                   source=str(voice), file_type=3)) == "FI-big"
-    assert seen == {"scope": "groups", "owner_id": "G1", "size": 44,
-                    "file_name": "long.wav", "file_type": 3}
+    assert {k: v for k, v in seen.items() if k != "digests"} == {
+        "scope": "groups", "owner_id": "G1", "size": 44,
+        "file_name": "long.wav", "file_type": 3}
+    assert seen["digests"] is not None            # hashed off the loop, then handed in
 
 
 def test_huge_local_file_is_capped_before_it_is_held_in_memory(tmp_path, monkeypatch):
@@ -799,4 +803,110 @@ def test_explicit_file_name_survives_to_the_upload_body():
     conn2 = _conn([_Response({"file_info": "FI2"}), _Response({"id": "m-file2"})])
     run(conn2.upload_private_file(payload, "notes.txt", user_id="U1"))
     assert conn2._http.calls[0][2]["file_name"] == "notes.txt"
+
+# ---- round 7: what the self-check found still open -------------------------
+
+def test_at_frame_without_is_you_still_teaches_the_group_bot_openid():
+    # Greptile r4559361506 asked for learning from the event that confirms the mention;
+    # CodeRabbit r4559434694 and wehos r4571618096 point 2 asked for the same fallback.
+    # Counting alone left the group teaching nothing, so every later inline-only full
+    # push answered is_at_bot=False and a direct summon was ignored.
+    conn = _conn()
+    msg = conn._convert_event("GROUP_AT_MESSAGE_CREATE", {
+        "id": "m-learn", "group_openid": "G3", "content": "<@LEARNME000000000> 在吗",
+        "author": {"member_openid": "H"},
+    })
+    assert msg["is_at_bot"] is True
+    assert conn._remembered_bot_openid("G3") == "LEARNME000000000"
+
+    later = conn._convert_event("GROUP_MESSAGE_CREATE", {
+        "id": "m-later", "group_openid": "G3", "content": "再喊一次 <@LEARNME000000000>",
+        "author": {"member_openid": "H"},
+    })
+    assert later["is_at_bot"] is True
+    assert later["mentions_other_user"] is False
+
+
+def test_at_frame_with_two_mentions_does_not_learn_the_wrong_id():
+    conn = _conn()
+    conn._convert_event("GROUP_AT_MESSAGE_CREATE", {
+        "id": "m-two", "group_openid": "G4",
+        "content": "<@AAAAAAAAAAAAAAAA> <@BBBBBBBBBBBBBBBB>",
+        "author": {"member_openid": "H"},
+    })
+    # Ambiguous: two targets, no is_you. Guessing here would poison the group's
+    # attribution for good, so nothing is recorded.
+    assert conn._remembered_bot_openid("G4") == ""
+
+
+def test_identify_clears_the_probed_setting_as_well_as_the_observed_proof():
+    import asyncio
+    import json as _json
+
+    conn = _conn()
+    conn._recv_msg_setting_by_group["G1"] = "all"
+    conn._proactive_allowed_by_group["G1"] = True
+    conn._all_messages_observed_groups.add("G1")
+    conn._access_token = "t"
+    conn._token_expires_at = float("inf")
+
+    class _WS:
+        async def send(self, raw):
+            return None
+
+        async def recv(self):
+            await asyncio.sleep(0)
+            return _json.dumps({"op": 0, "t": "READY", "s": 1,
+                                "d": {"session_id": "S", "user": {"id": "u"}}})
+
+        async def close(self):
+            return None
+
+    conn._ws = _WS()
+    run(conn._handshake(is_reconnect=False))
+    assert conn.receives_all_messages is False
+    assert conn.group_recv_msg_setting("G1") == ""
+    assert conn.group_proactive_allowed("G1") is None
+
+
+def test_token_failure_before_a_text_send_degrades_to_none():
+    # The senders call the token pre-flight themselves, outside _api. When
+    # _refresh_token started rejecting token-less bodies, that raised straight
+    # through send_group_message_segments -- and the caller awaits it without a try.
+    conn = _conn([_Response({"err_code": 1129, "message": "too many requests"})])
+    conn._access_token = ""
+    conn._token_expires_at = 0
+    assert run(conn.send_group_message_segments("G1", [
+        {"type": "text", "data": {"text": "hi"}}])) is None
+    assert run(conn.send_private_message_segments("U1", [
+        {"type": "text", "data": {"text": "hi"}}])) is None
+    # Only the token attempt was made: no message POST burned a request.
+    assert all("/messages" not in call[1] for call in conn._http.calls)
+
+
+def test_chunked_upload_is_handed_precomputed_digests(monkeypatch):
+    from utils.connection.qq import open_platform as op
+
+    seen = {}
+
+    async def fake_chunked(*, scope, owner_id, payload, file_name, file_type, digests=None):
+        seen["digests"] = digests
+        return "FI"
+
+    conn = _conn()
+    monkeypatch.setattr(conn, "_media_upload_chunked", fake_chunked)
+    monkeypatch.setattr(op, "INLINE_UPLOAD_MAX_BYTES", 4)
+    raw = b"z" * 64
+    out = run(conn._upload_media(scope="groups", owner_id="G1", file_type=3,
+                                 source="base64://" + __import__("base64").b64encode(raw).decode()))
+    assert out == "FI"
+    assert seen["digests"] == op._digests(raw)      # hashed off the loop, not inside
+
+
+def test_connection_wide_flags_answer_when_every_group_agrees():
+    conn = _conn()
+    conn._recv_msg_setting_by_group.update({"G1": "all", "G2": "all"})
+    assert conn.recv_msg_setting == "all"           # agreement is an answer
+    conn._recv_msg_setting_by_group["G3"] = "only_mention"
+    assert conn.recv_msg_setting == ""              # disagreement is not
 

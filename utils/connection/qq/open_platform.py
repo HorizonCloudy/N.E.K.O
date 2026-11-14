@@ -16,7 +16,8 @@ import websockets
 
 from ..base import ConnectionBase
 from .open_platform_media import (
-    QQOpenPlatformMediaMixin, _BASE64_PREFIX, _brief, _decode_base64_source, _local_path)
+    QQOpenPlatformMediaMixin, _BASE64_PREFIX, _brief, _decode_base64_source,
+    _digests, _local_path)
 
 _CQ_CODE_RE = _re.compile(r"\[CQ:(\w+),([^\]]+)\]")
 
@@ -585,10 +586,13 @@ class QQOpenPlatformConnection(QQOpenPlatformMediaMixin, ConnectionBase):
         Returning the first entry would be the bug this avoids: dict order is an
         accident of which group spoke first.
         """
-        values = list(self._mutable(container, dict).values())
+        values = {str(v or "") for v in self._mutable(container, dict).values()}
         if len(values) != 1:
+            # Two groups, two answers: there is no connection-wide value worth
+            # reporting, and picking one would make the result depend on which group
+            # spoke first.
             return ""
-        return str(values[0] or "")
+        return values.pop()
 
     async def get_login_info(self) -> dict[str, Any]:
         return {"user_id": self._self_id, "nickname": self._self_nickname}
@@ -660,6 +664,12 @@ class QQOpenPlatformConnection(QQOpenPlatformMediaMixin, ConnectionBase):
         # above and keeps the known-good value, which is why the reset belongs here and
         # not in the reconnect path.
         self._mutable("_all_messages_observed_groups", set).clear()
+        # The setting map is a claim about the *current* session's privileges too. A
+        # group can go from "all" to "@-only" while we are down, and nothing else
+        # expires this value, so leaving it would advertise a mode the platform has
+        # taken away -- the same latch the commits above promise to re-learn.
+        self._mutable("_recv_msg_setting_by_group", dict).clear()
+        self._mutable("_proactive_allowed_by_group", dict).clear()
         await self._ws.send(json.dumps({
             "op": 2, "d": {
                 "token": f"QQBot {self._access_token}",
@@ -921,6 +931,13 @@ class QQOpenPlatformConnection(QQOpenPlatformMediaMixin, ConnectionBase):
         still runs inline, since by definition it already returned.
         """
         for sink in list(self._mutable("_event_sinks", list)):
+            if asyncio.iscoroutinefunction(sink):
+                # The call happens inside the task. Calling first and wrapping after
+                # leaves a coroutine object that no one awaits when the task is
+                # cancelled before its first step -- a shutdown-under-traffic warning
+                # on every such notification, and the notice vanishes without a log.
+                self._spawn_notice_sink(sink, event_type, payload)
+                continue
             try:
                 result = sink(event_type, payload)
             except Exception as exc:  # a broken consumer must not drop the transport
@@ -929,23 +946,38 @@ class QQOpenPlatformConnection(QQOpenPlatformMediaMixin, ConnectionBase):
                 continue
             if not asyncio.iscoroutine(result):
                 continue
-            tasks = self._mutable("_sink_tasks", set)
-            if len(tasks) >= _NOTICE_SINK_MAX_TASKS:
-                # Bounded on purpose: a sink that never finishes must not turn a
-                # traffic burst into an unbounded task pile. Dropping the newest
-                # notification is visible in the log; blocking the loop is not.
-                result.close()
-                if self.logger:
-                    self.logger.warning(
-                        f"[QQOpenPlatform] 事件监听任务已满（{_NOTICE_SINK_MAX_TASKS}），"
-                        f"丢弃 {event_type} 的一次通知"
-                    )
-                continue
-            task = asyncio.create_task(self._await_notice_sink(result, event_type, sink))
-            tasks.add(task)
-            task.add_done_callback(tasks.discard)
+            self._adopt_notice_sink(self._await_notice_sink(result, event_type), event_type)
 
-    async def _await_notice_sink(self, coro, event_type: str, sink) -> None:
+    def _spawn_notice_sink(self, sink, event_type: str, payload: dict) -> None:
+        """Schedule a coroutine sink so the call itself happens inside the task."""
+        async def _call_and_await():
+            # The sink call happens here, inside the task. Awaiting the returned
+            # coroutine keeps a cancelled task from destroying an un-awaited
+            # coroutine object.
+            result = sink(event_type, payload)
+            if asyncio.iscoroutine(result):
+                await result
+
+        self._adopt_notice_sink(_call_and_await(), event_type)
+
+    def _adopt_notice_sink(self, coro, event_type: str) -> None:
+        tasks = self._mutable("_sink_tasks", set)
+        if len(tasks) >= _NOTICE_SINK_MAX_TASKS:
+            # Bounded on purpose: a sink that never finishes must not turn a traffic
+            # burst into an unbounded task pile. Dropping the newest notification is
+            # visible in the log; blocking the loop is not.
+            coro.close()
+            if self.logger:
+                self.logger.warning(
+                    f"[QQOpenPlatform] 事件监听任务已满（{_NOTICE_SINK_MAX_TASKS}），"
+                    f"丢弃 {event_type} 的一次通知"
+                )
+            return
+        task = asyncio.create_task(self._await_notice_sink(coro, event_type))
+        tasks.add(task)
+        task.add_done_callback(tasks.discard)
+
+    async def _await_notice_sink(self, coro, event_type: str) -> None:
         """Await one detached sink with its own deadline."""
         try:
             async with asyncio.timeout(_NOTICE_SINK_TIMEOUT_SECONDS):
@@ -1585,7 +1617,16 @@ class QQOpenPlatformConnection(QQOpenPlatformMediaMixin, ConnectionBase):
         if not content and not image_url:
             return None
 
-        await self._ensure_token()
+        try:
+            await self._ensure_token()
+        except Exception as exc:
+            # The classified QQOpenPlatformAPIError used to escape here: the review
+            # contract for these senders is "None means not delivered", and the caller
+            # awaits them without a try, so raising lost the whole reply instead of
+            # degrading it.
+            if self.logger:
+                self.logger.warning(f"[QQOpenPlatform] 群消息发送前 token 不可用: {exc}")
+            return None
         body: dict[str, Any] = {}
         # Group images must be uploaded first to get file_info, then sent via msg_type=7 + media.
         if image_url:
@@ -1741,7 +1782,13 @@ class QQOpenPlatformConnection(QQOpenPlatformMediaMixin, ConnectionBase):
         if not content and not image_url:
             return None
 
-        await self._ensure_token()
+        try:
+            await self._ensure_token()
+        except Exception as exc:
+            # Same reason as the group branch above.
+            if self.logger:
+                self.logger.warning(f"[QQOpenPlatform] 私聊消息发送前 token 不可用: {exc}")
+            return None
         body: dict[str, Any] = {}
         # Private images are the same two steps as group ones (upload -> msg_type=7 +
         # media.file_info); what makes the platform accept the send is the **users**
@@ -2069,6 +2116,15 @@ class QQOpenPlatformConnection(QQOpenPlatformMediaMixin, ConnectionBase):
                 elif isinstance(item, str) and item.strip():
                     if item.strip() not in mentioned_ids:
                         mentioned_ids.append(item.strip())
+            if event_type == "GROUP_AT_MESSAGE_CREATE" and not at_bot_by_payload:
+                # The platform only emits this event when *this* bot was addressed, so a
+                # single mention here is the bot -- that is as authoritative as is_you,
+                # and it is the only source that works if the flag turns out to be
+                # absent in the wild (still unconfirmed on a live bot). Learning, not
+                # just counting: without the id every later full push in this group
+                # answers is_at_bot=False and silently ignores a direct summon.
+                if len(mentioned_ids) == 1 and not self._remembered_bot_openid(group_id):
+                    self._learn_bot_openid(group_id, mentioned_ids[0])
             clean_content = _AT_OPENID_RE.sub("", _AT_LEGACY_RE.sub("", content))
             clean_content = clean_content.replace("<@all>", "").strip()
             mentions_all = "<@all>" in content
@@ -2300,9 +2356,15 @@ class QQOpenPlatformConnection(QQOpenPlatformMediaMixin, ConnectionBase):
                 # looked dead on a real recording.
                 try:
                     await self._ensure_token()
+                    # digests in a thread: the mixin computes MD5 + SHA1 over the
+                    # whole payload itself when the caller does not pass them, which
+                    # for a 200 MB file is a multi-second stall of the one event loop
+                    # every other channel shares.
+                    digests = await asyncio.to_thread(_digests, raw)
                     return await self._media_upload_chunked(
                         scope=scope, owner_id=owner_id, payload=raw,
-                        file_name=file_name, file_type=int(file_type))
+                        file_name=file_name, file_type=int(file_type),
+                        digests=digests)
                 except Exception as exc:
                     # Broad on purpose, and only for this branch. The chunked protocol
                     # lives in the media mixin and posts through ``_media_post``, which
