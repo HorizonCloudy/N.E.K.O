@@ -15,7 +15,8 @@ import httpx
 import websockets
 
 from ..base import ConnectionBase
-from .open_platform_media import QQOpenPlatformMediaMixin
+from .open_platform_media import (
+    QQOpenPlatformMediaMixin, _BASE64_PREFIX, _brief, _decode_base64_source, _local_path)
 
 _CQ_CODE_RE = _re.compile(r"\[CQ:(\w+),([^\]]+)\]")
 
@@ -1322,12 +1323,7 @@ class QQOpenPlatformConnection(QQOpenPlatformMediaMixin, ConnectionBase):
                     body["markdown"] = {"content": content}
 
         try:
-            resp = await self._http.post(
-                f"{self._API_BASE}/v2/groups/{group_id}/messages",
-                json=body,
-                headers=self._auth_headers(),
-            )
-            data = resp.json()
+            data = await self._api("POST", f"/v2/groups/{group_id}/messages", payload=body)
             msg_id = str(data.get("id") or "")
             if msg_id and record_sent:
                 self.record_sent_message_id(msg_id)
@@ -1448,12 +1444,7 @@ class QQOpenPlatformConnection(QQOpenPlatformMediaMixin, ConnectionBase):
             body["msg_seq"] = self._next_msg_seq(reply_msg_id)
 
         try:
-            resp = await self._http.post(
-                f"{self._API_BASE}/v2/users/{user_id}/messages",
-                json=body,
-                headers=self._auth_headers(),
-            )
-            data = resp.json()
+            data = await self._api("POST", f"/v2/users/{user_id}/messages", payload=body)
             msg_id = str(data.get("id") or "")
             if msg_id and record_sent:
                 self.record_sent_message_id(msg_id)
@@ -1463,8 +1454,11 @@ class QQOpenPlatformConnection(QQOpenPlatformMediaMixin, ConnectionBase):
                 self.logger.warning(f"[QQOpenPlatform] 发送私聊失败: {e}")
             return None
 
-    async def send_group_poke(self, group_id: str, user_id: str, **_: Any) -> Optional[str]:
-        raise self._unsupported("poke", "v2 has no poke interface for any conversation")
+    async def send_group_poke(self, group_id: str, user_id: str, **_: Any) -> bool:
+        # base.py:111 pins this entry point to `-> bool` and the reply path does not guard
+        # it, so raising here dropped the whole group reply over a bit of decoration.
+        return False
+
     async def send_group_image(
         self, group_id: str, image_data: str, *, reply_message_id: str = "", at_user_id: str = "", sub_type: str = ""
     ) -> Optional[str]:
@@ -1502,13 +1496,9 @@ class QQOpenPlatformConnection(QQOpenPlatformMediaMixin, ConnectionBase):
         the qq_auto_reply plugin still assembles the former.
         """
         try:
-            await self._ensure_token()
-            resp = await self._http.post(
-                f"{self._API_BASE}/v2/groups/{group_id}/messages",
-                json={"msg_type": 8, "card": self._card_message_payload(ark_obj)},
-                headers=self._auth_headers(),
-            )
-            data = resp.json()
+            data = await self._api(
+                "POST", f"/v2/groups/{group_id}/messages",
+                payload={"msg_type": 8, "card": self._card_message_payload(ark_obj)})
             return bool(data.get("id"))
         except Exception as e:
             if self.logger:
@@ -1646,6 +1636,13 @@ class QQOpenPlatformConnection(QQOpenPlatformMediaMixin, ConnectionBase):
         # finds a value only if the protocol adds a key later. Missing nickname is
         # bucketed by the qq_auto_reply plugin's display_name_service.
         user_nickname = str(author.get("username") or "") or None
+        # v2 attaches a swipe-reply's target as ``message_reference``; a quoted id in
+        # our recorded sends means the user answered the bot. No get_msg fallback:
+        # unlike OneBotClient._is_reply_to_bot_message, v2 has no by-id endpoint.
+        reference = data.get("message_reference")
+        quoted_message_id = (
+            str(reference.get("message_id") or "") if isinstance(reference, dict) else "")
+        is_reply_to_bot = quoted_message_id in self.sent_message_ids
 
         if event_type == "C2C_MESSAGE_CREATE":
             return {
@@ -1657,9 +1654,9 @@ class QQOpenPlatformConnection(QQOpenPlatformMediaMixin, ConnectionBase):
                 "message_id": str(data.get("id") or ""),
                 "timestamp": int(time.time()),
                 "is_at_bot": True,
-                "is_reply_to_bot": False,
+                "is_reply_to_bot": is_reply_to_bot,
                 "group_id": "",
-                "quoted_message_id": "",
+                "quoted_message_id": quoted_message_id,
                 "mentioned_user_ids": [],
                 "mentions_other_user": False,
                 "mentions_all": False,
@@ -1797,9 +1794,9 @@ class QQOpenPlatformConnection(QQOpenPlatformMediaMixin, ConnectionBase):
                 "message_id": str(data.get("id") or ""),
                 "timestamp": int(time.time()),
                 "is_at_bot": is_at_bot,
-                "is_reply_to_bot": False,
+                "is_reply_to_bot": is_reply_to_bot,
                 "group_id": group_id,
-                "quoted_message_id": "",
+                "quoted_message_id": quoted_message_id,
                 "mentioned_user_ids": mentioned_ids,
                 "mentions_other_user": mentions_other_user,
                 "mentions_all": mentions_all,
@@ -1888,14 +1885,25 @@ class QQOpenPlatformConnection(QQOpenPlatformMediaMixin, ConnectionBase):
             body: dict[str, Any] = {
                 "file_type": int(file_type), "url": source, "srv_send_msg": False}
         else:
-            path = source[7:] if source.startswith("file://") else source
-            try:
-                raw = await asyncio.to_thread(_read_bytes, path)
-            except Exception as exc:
-                if self.logger:
-                    self.logger.warning(f"[QQOpenPlatform] 富媒体读取失败: {exc}")
-                return ""
+            if source.startswith(_BASE64_PREFIX):
+                # The payload already sits in memory as a str, so there is nothing to
+                # protect here beyond the byte cap below. shortcut: the name comes from
+                # the image magic table; extend it per file_type when a caller appears.
+                decoded = await asyncio.to_thread(
+                    _decode_base64_source, source[len(_BASE64_PREFIX):])
+                raw, file_name = decoded.payload, decoded.file_name
+            else:
+                path = _local_path(source)
+                file_name = path.replace("\\", "/").rsplit("/", 1)[-1]
+                try:
+                    raw = await asyncio.to_thread(_read_bytes, path)
+                except Exception as exc:
+                    if self.logger:
+                        self.logger.warning(f"[QQOpenPlatform] 富媒体读取失败: {exc}")
+                    return ""
             if not raw:
+                if self.logger:
+                    self.logger.warning(f"[QQOpenPlatform] 富媒体内容为空或读不到: {_brief(source)}")
                 return ""
             if len(raw) > INLINE_UPLOAD_MAX_BYTES:
                 if self.logger:
@@ -1905,7 +1913,7 @@ class QQOpenPlatformConnection(QQOpenPlatformMediaMixin, ConnectionBase):
                 return ""
             body = {
                 "file_type": int(file_type),
-                "file_name": path.replace("\\", "/").rsplit("/", 1)[-1],
+                "file_name": file_name,
                 "file_data": base64.b64encode(raw).decode("ascii"),
                 "srv_send_msg": False,
             }

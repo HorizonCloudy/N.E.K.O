@@ -18,6 +18,7 @@ one raises with the reason in the message.
 from __future__ import annotations
 
 import asyncio
+import base64
 import json
 
 import pytest
@@ -27,6 +28,16 @@ from utils.connection.qq.open_platform import (
     QQOpenPlatformConnection,
     QQOpenPlatformUnsupportedError,
 )
+
+
+class _Log:
+    """Collects the warnings the connector emits."""
+
+    def __init__(self):
+        self.lines: list[str] = []
+
+    def warning(self, message: str) -> None:
+        self.lines.append(message)
 
 
 class _Response:
@@ -321,6 +332,25 @@ def test_both_documented_mute_codes_are_recorded():
         assert conn.is_group_muted("G5") is True
 
 
+def test_the_send_bodies_share_the_mute_and_token_handling():
+    """Posting around `_api` hides `err_code`: no mute record, no refresh, no retry."""
+    text = [{"type": "text", "data": {"text": "在的"}}]
+    muted = _conn([_Response({"err_code": 40054002, "message": "机器人已被禁言"}, 400)])
+    assert run(muted.send_group_message_segments("G5", text)) is None
+    assert muted.is_group_muted("G5") is True
+
+    card = _conn([_Response({"err_code": 40054002, "message": "机器人已被禁言"}, 400)])
+    assert run(card.send_group_ark_card("G6", {"title": "状态"})) is False
+    assert card.is_group_muted("G6") is True
+
+    stale = _conn([_Response({"err_code": 40011027, "message": "AccessToken无效或过期"}, 401),
+                   _Response({"access_token": "t2", "expires_in": 7200}),
+                   _Response({"id": "m-new"})])
+    assert run(stale.send_private_message_segments("U1", text)) == "m-new"
+    assert stale._http.calls[1][1] == stale._TOKEN_URL
+    assert len(stale._http.calls) == 3
+
+
 def test_write_calls_may_succeed_as_204_with_no_body():
     conn = _conn([_Response(None, 204)])
     assert run(conn.set_group_ban("G1", "M1", 0)) == {"status": "ok"}
@@ -403,6 +433,34 @@ def test_voice_message_uploads_file_type_three_then_sends_msg_type_seven():
     assert "m-voice" in conn.sent_message_ids
 
 
+def test_local_media_source_reads_a_three_slash_file_uri(tmp_path):
+    voice = tmp_path / "a b.wav"
+    voice.write_bytes(b"RIFFfake")
+    conn = _conn([_Response({"file_info": "FI-local"}), _Response({"id": "m-local"})])
+    assert run(conn.send_private_record("U1", voice.as_uri())) == "m-local"
+    upload = conn._http.calls[0]
+    assert upload[1].endswith("/v2/users/U1/files")
+    assert upload[2]["file_type"] == 3 and upload[2]["file_name"] == "a b.wav"
+    assert base64.b64decode(upload[2]["file_data"]) == b"RIFFfake"
+
+
+def test_base64_media_source_uploads_inline_bytes():
+    conn = _conn([_Response({"file_info": "FI-b64"}), _Response({"id": "m-b64"})])
+    source = "base64://" + base64.b64encode(b"RIFFfake").decode()
+    assert run(conn.send_group_record("G1", source)) == "m-b64"
+    body = conn._http.calls[0][2]
+    assert body["file_type"] == 3
+    assert base64.b64decode(body["file_data"]) == b"RIFFfake"
+
+
+def test_a_media_source_that_cannot_be_read_is_named_in_the_log():
+    conn = _conn()
+    conn.logger = _Log()
+    assert run(conn.send_group_record("G1", "no-such-voice.wav")) is None
+    assert not conn._http.calls
+    assert conn.logger.lines and "no-such-voice.wav" in conn.logger.lines[0]
+
+
 def test_ark_card_request_is_translated_into_a_card_payload():
     conn = _conn()
     assert run(conn.send_group_ark_card("G1", {"ark": {"kv": [
@@ -433,11 +491,22 @@ def test_unsupported_operations_raise_with_a_reason(name):
     assert "v2" in str(caught.value) or "platform" in str(caught.value).lower()
 
 
-def test_poke_is_unsupported_on_every_entry_point():
+def test_poke_raises_on_the_non_contract_entry_points():
     conn = _conn()
-    for name in ("send_group_poke", "group_poke", "friend_poke"):
+    for name in ("group_poke", "friend_poke"):
         with pytest.raises(QQOpenPlatformUnsupportedError):
             run(getattr(conn, name)(group_id="G1", user_id="U1"))
+
+
+def test_send_group_poke_answers_false_rather_than_raising():
+    """The contract entry point returns a bool, so callers do not guard it.
+
+    A poke is decoration: raising aborted the whole reply, and a text line that fakes a
+    poke is worse than saying it was not sent.
+    """
+    conn = _conn()
+    assert run(conn.send_group_poke("G1", "U1")) is False
+    assert conn._http.calls == []
 
 
 def test_stubs_are_gone_from_the_surface():
