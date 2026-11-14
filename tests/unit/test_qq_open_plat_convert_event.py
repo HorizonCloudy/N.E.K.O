@@ -309,6 +309,7 @@ def test_full_message_first_does_not_swallow_the_later_at_signal():
     assert conn._message_queue.qsize() == 1          # still delivered once
     queued = conn._message_queue.get_nowait()
     assert queued["is_at_bot"] is True               # ... and the @ survived
+    assert queued["mentions_other_user"] is False    # ... with correct ownership
     assert "EEEEEEEEEEEEEEEE" in queued["mentioned_user_ids"]
 
 
